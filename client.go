@@ -23,15 +23,18 @@ func mustParseURL(s string) *url.URL {
 	return u
 }
 
-var (
+const (
 	urlBase         = "https://moj.neoserv.si"
-	urlBaseP        = mustParseURL(urlBase)
 	urlLogin        = urlBase + "/prijava/preveri"
 	urlZones        = urlBase + "/storitve"
 	urlZone         = urlBase + "/storitve/domena/dns"
 	urlAddRecord    = urlBase + "/storitve/domena/shranidnszapis"
 	urlEditRecord   = urlBase + "/storitve/domena/popravizapis"
 	urlDeleteRecord = urlBase + "/storitve/domena/odstranizapis"
+)
+
+var (
+	urlBaseP = mustParseURL(urlBase)
 )
 
 // init initializes the Provider with an HTTP client and caching.

@@ -34,19 +34,22 @@ type Provider struct {
 
 // Neoserv API does not support all TTL values. The following are the supported TTL values.
 // Check Provider.UnsupportedTTLisError to determine how unsupported TTL values are handled.
+const (
+	TTL1m  = 1 * time.Minute
+	TTL5m  = 5 * time.Minute
+	TTL15m = 15 * time.Minute
+	TTL30m = 30 * time.Minute
+	TTL1h  = 1 * time.Hour
+	TTL6h  = 6 * time.Hour
+	TTL12h = 12 * time.Hour
+	TTL24h = 24 * time.Hour
+	TTL2d  = 2 * 24 * time.Hour
+	TTL7d  = 7 * 24 * time.Hour
+	TTL14d = 14 * 24 * time.Hour
+	TTL30d = 30 * 24 * time.Hour
+)
+
 var (
-	TTL1m     = 1 * time.Minute
-	TTL5m     = 5 * time.Minute
-	TTL15m    = 15 * time.Minute
-	TTL30m    = 30 * time.Minute
-	TTL1h     = 1 * time.Hour
-	TTL6h     = 6 * time.Hour
-	TTL12h    = 12 * time.Hour
-	TTL24h    = 24 * time.Hour
-	TTL2d     = 2 * 24 * time.Hour
-	TTL7d     = 7 * 24 * time.Hour
-	TTL14d    = 14 * 24 * time.Hour
-	TTL30d    = 30 * 24 * time.Hour
 	ValidTTLs = []time.Duration{
 		TTL1m, TTL5m, TTL15m, TTL30m, TTL1h, TTL6h, TTL12h, TTL24h, TTL2d, TTL7d, TTL14d, TTL30d,
 	}
