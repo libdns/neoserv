@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/libdns/libdns"
@@ -30,6 +31,9 @@ type Provider struct {
 	// zoneIdCache is a map of zone names to their corresponding zone IDs.
 	// This is used to avoid making unnecessary API calls to get the zone ID.
 	zoneIdCache map[string]string
+
+	// mutex is used to synchronize access to the provider.
+	mutex sync.Mutex
 }
 
 // Neoserv API does not support all TTL values. The following are the supported TTL values.

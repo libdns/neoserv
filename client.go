@@ -38,6 +38,7 @@ var (
 )
 
 // init initializes the Provider with an HTTP client and caching.
+// Expects the caller to hold the mutex.
 func (p *Provider) init() error {
 	if p.client != nil {
 		return nil
@@ -55,6 +56,7 @@ func (p *Provider) init() error {
 }
 
 // authenticate starts a new session and authenticates with the Neoserv.
+// Expects the caller to hold the mutex.
 func (p *Provider) authenticate(ctx context.Context) error {
 	// Initialize the provider if it hasn't been already.
 	if err := p.init(); err != nil {
@@ -111,7 +113,13 @@ func (p *Provider) authenticate(ctx context.Context) error {
 }
 
 // getZoneID returns the zone ID for the given zone name.
+// This function caches the zone ID to avoid making unnecessary API calls.
 func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
+	// Lock the provider to ensure that only one goroutine is authenticating
+	// and modifying the zone ID cache at a time.
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
 	// Authenticate if necessary.
 	if err := p.authenticate(ctx); err != nil {
 		return "", errors.Wrap(err, "failed to get zone ID")
