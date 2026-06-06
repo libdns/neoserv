@@ -1,6 +1,9 @@
 Neoserv for [`libdns`](https://github.com/libdns/libdns)
 =======================
 
+> [!WARNING]
+> This package is outdate since Neoserv has changed their web interface and is no longer working. PRs to update the package are welcome.
+
 [![Go Reference](https://pkg.go.dev/badge/test.svg)](https://pkg.go.dev/github.com/libdns/neoserv)
 
 This package implements the [libdns interfaces](https://github.com/libdns/libdns) for [Neoserv](https://moj.neoserv.si), allowing you to manage DNS records.
