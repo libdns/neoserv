@@ -88,6 +88,11 @@ type snapshotRecordData struct {
 	Record   string            `json:"record"`
 	TTL      json.RawMessage   `json:"ttl"`
 	Priority json.RawMessage   `json:"priority"`
+	Weight   json.RawMessage   `json:"weight"`
+	Port     json.RawMessage   `json:"port"`
+	CAAFlag  json.RawMessage   `json:"caa_flag"`
+	CAAType  string            `json:"caa_type"`
+	CAAValue string            `json:"caa_value"`
 	Locked   bool              `json:"locked"`
 }
 
@@ -98,6 +103,8 @@ type neoservForm struct {
 	value      string
 	ttl        int
 	priority   int
+	weight     int
+	port       int
 	caaFlag    int
 	caaType    string
 }
@@ -485,17 +492,29 @@ func snapshotRecordToLibdns(r snapshotRecordData) (libdns.Record, error) {
 	case "MX":
 		prio := parsePriorityRaw(r.Priority)
 		return libdns.MX{Name: name, TTL: ttl, Preference: prio, Target: r.Record, ProviderData: id}, nil
+	case "SRV":
+		// Neoserv stores the full "_service._transport.name" owner in Host. We keep
+		// Service and Transport empty so SRV.RR() uses Name verbatim, preserving the
+		// round trip regardless of how the underscored labels are structured.
+		return libdns.SRV{
+			Name:         name,
+			TTL:          ttl,
+			Priority:     parsePriorityRaw(r.Priority),
+			Weight:       parsePriorityRaw(r.Weight),
+			Port:         parsePriorityRaw(r.Port),
+			Target:       r.Record,
+			ProviderData: id,
+		}, nil
 	case "NS":
 		return libdns.NS{Name: name, TTL: ttl, Target: r.Record, ProviderData: id}, nil
+	case "ALIAS":
+		return ALIAS{Name: name, TTL: ttl, Target: r.Record, ProviderData: id}, nil
 	case "TXT":
 		return libdns.TXT{Name: name, TTL: ttl, Text: r.Record, ProviderData: id}, nil
 	case "CAA":
-		parts := strings.SplitN(r.Record, " ", 3)
-		if len(parts) == 3 {
-			flag, _ := strconv.ParseUint(parts[0], 10, 8)
-			return libdns.CAA{Name: name, TTL: ttl, Flags: uint8(flag), Tag: parts[1], Value: parts[2], ProviderData: id}, nil
-		}
-		return unknownRecord{name: name, ttl: ttl, recordType: typeStr, data: r.Record, providerData: id}, nil
+		// CAA rows carry their parts in dedicated fields rather than in Record.
+		flag, _ := strconv.ParseUint(strings.Trim(string(r.CAAFlag), `"`), 10, 8)
+		return libdns.CAA{Name: name, TTL: ttl, Flags: uint8(flag), Tag: r.CAAType, Value: r.CAAValue, ProviderData: id}, nil
 	default:
 		return unknownRecord{name: name, ttl: ttl, recordType: typeStr, data: r.Record, providerData: id}, nil
 	}
@@ -521,8 +540,12 @@ func libdnsRecordToNeoservForm(r libdns.Record) neoservForm {
 		return neoservForm{recordType: "CNAME", host: host, value: v.Target, ttl: ttl}
 	case libdns.MX:
 		return neoservForm{recordType: "MX", host: host, value: v.Target, ttl: ttl, priority: int(v.Preference)}
+	case libdns.SRV:
+		return neoservForm{recordType: "SRV", host: host, value: v.Target, ttl: ttl, priority: int(v.Priority), weight: int(v.Weight), port: int(v.Port)}
 	case libdns.NS:
 		return neoservForm{recordType: "NS", host: host, value: v.Target, ttl: ttl}
+	case ALIAS:
+		return neoservForm{recordType: "ALIAS", host: host, value: v.Target, ttl: ttl}
 	case libdns.TXT:
 		return neoservForm{recordType: "TXT", host: host, value: v.Text, ttl: ttl}
 	case libdns.CAA:
@@ -592,6 +615,8 @@ func (p *Provider) createRecord(ctx context.Context, zone string, record libdns.
 		"form.record":      form.value,
 		"form.ttl":         form.ttl,
 		"form.priority":    form.priority,
+		"form.weight":      form.weight,
+		"form.port":        form.port,
 		"show":             true,
 	}
 	if form.recordType == "CAA" {
@@ -661,6 +686,8 @@ func (p *Provider) updateRecord(ctx context.Context, zone string, record libdns.
 		"form.record":    form.value,
 		"form.ttl":       form.ttl,
 		"form.priority":  form.priority,
+		"form.weight":    form.weight,
+		"form.port":      form.port,
 		"showEditDialog": true,
 	}
 	if form.recordType == "CAA" {
@@ -793,6 +820,9 @@ func recordID(r libdns.Record) string {
 		s, _ := v.ProviderData.(string)
 		return s
 	case libdns.ServiceBinding:
+		s, _ := v.ProviderData.(string)
+		return s
+	case ALIAS:
 		s, _ := v.ProviderData.(string)
 		return s
 	case unknownRecord:

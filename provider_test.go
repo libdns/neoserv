@@ -157,6 +157,83 @@ func TestGetRecordsNotFound(t *testing.T) {
 	t.Logf("GetRecords failed as expected: %s", err)
 }
 
+// TestRecordTypeRoundTrip exercises every libdns record type that Neoserv
+// supports (A, AAAA, CNAME, MX, NS, TXT, SRV, CAA) through a full
+// append -> read back -> delete cycle. Each subtest cleans up after itself.
+// All records use names under test*.zone.com.
+func TestRecordTypeRoundTrip(t *testing.T) {
+	cases := []struct {
+		name   string
+		record libdns.Record
+	}{
+		{"A", libdns.Address{Name: "test-a", IP: netip.MustParseAddr("203.0.113.10"), TTL: TTL1h}},
+		{"AAAA", libdns.Address{Name: "test-aaaa", IP: netip.MustParseAddr("2001:db8::1"), TTL: TTL1h}},
+		{"CNAME", libdns.CNAME{Name: "test-cname", Target: "example.com", TTL: TTL1h}},
+		{"MX", libdns.MX{Name: "test-mx", Preference: 10, Target: "mail.example.com", TTL: TTL1h}},
+		{"NS", libdns.NS{Name: "test-ns", Target: "ns1.example.com", TTL: TTL1h}},
+		{"ALIAS", ALIAS{Name: "test-alias", Target: "example.com", TTL: TTL1h}},
+		{"TXT", libdns.TXT{Name: "test-txt", Text: "hello world", TTL: TTL1h}},
+		{"SRV", libdns.SRV{Service: "sip", Transport: "tcp", Name: "test-srv", Priority: 10, Weight: 20, Port: 5060, Target: "sipserver.example.com", TTL: TTL1h}},
+		{"CAA", libdns.CAA{Name: "test-caa", Flags: 0, Tag: "issue", Value: "letsencrypt.org", TTL: TTL1h}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			added, err := provider.AppendRecords(ctx, zone, []libdns.Record{c.record})
+			if err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			if len(added) != 1 {
+				t.Fatalf("expected 1 record added, got %d", len(added))
+			}
+			got := added[0]
+			if recordID(got) == "" {
+				t.Fatal("appended record has no ID")
+			}
+			if !sameRecord(got, c.record) {
+				t.Fatalf("appended mismatch: want %q, got %q", c.record.RR().Data, got.RR().Data)
+			}
+
+			records, err := provider.GetRecords(ctx, zone)
+			if err != nil {
+				t.Fatalf("get records: %v", err)
+			}
+			var found libdns.Record
+			for _, r := range records {
+				if recordID(r) == recordID(got) {
+					found = r
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("record %s not found after append", c.name)
+			}
+			if !sameRecord(found, c.record) {
+				t.Fatalf("readback mismatch: want name=%q data=%q, got name=%q data=%q",
+					c.record.RR().Name, c.record.RR().Data, found.RR().Name, found.RR().Data)
+			}
+
+			deleted, err := provider.DeleteRecords(ctx, zone, []libdns.Record{found})
+			if err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			if len(deleted) != 1 {
+				t.Fatalf("expected 1 record deleted, got %d", len(deleted))
+			}
+
+			records, err = provider.GetRecords(ctx, zone)
+			if err != nil {
+				t.Fatalf("get records after delete: %v", err)
+			}
+			for _, r := range records {
+				if recordID(r) == recordID(got) {
+					t.Fatalf("record %s still present after delete", c.name)
+				}
+			}
+		})
+	}
+}
+
 func TestSetInvalidTTLtoValid(t *testing.T) {
 	provider.UnsupportedTTLisError = false
 	cases := []struct {
@@ -358,7 +435,8 @@ func TestDeleteTestingRecords(t *testing.T) {
 
 	toDelete := make([]libdns.Record, 0)
 	for _, record := range records {
-		if strings.HasPrefix(record.RR().Name, "test") {
+		name := record.RR().Name
+		if strings.HasPrefix(name, "test") || strings.Contains(name, ".test") {
 			toDelete = append(toDelete, record)
 		}
 	}

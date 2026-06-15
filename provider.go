@@ -60,6 +60,26 @@ var (
 	}
 )
 
+// ALIAS is a Neoserv-specific DNS record type that is not defined by the libdns
+// package. It behaves like a CNAME but is permitted at the zone apex, resolving
+// to the address records of the Target. It satisfies the libdns.Record interface
+// so it can be passed to and returned from the Provider's record methods.
+type ALIAS struct {
+	Name string
+	TTL  time.Duration
+	// Target is the canonical name the alias points to.
+	Target string
+
+	// ProviderData holds the Neoserv-assigned record ID. See the libdns package
+	// godoc for details on this field.
+	ProviderData any
+}
+
+// RR returns the libdns resource record representation of the ALIAS record.
+func (a ALIAS) RR() libdns.RR {
+	return libdns.RR{Name: a.Name, TTL: a.TTL, Type: "ALIAS", Data: a.Target}
+}
+
 // ListZones returns the list of DNS zones available to the account.
 func (p *Provider) ListZones(ctx context.Context) ([]libdns.Zone, error) {
 	return p.listZones(ctx)

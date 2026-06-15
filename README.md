@@ -21,6 +21,35 @@ Run it with:
 NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password NEOSERV_ZONE=your.domain go run ./examples/neoserv.go
 ```
 
+## Implemented Interfaces
+
+The provider implements the following `libdns` interfaces:
+
+- `libdns.ZoneLister` — list the zones available to the account
+- `libdns.RecordGetter` — list records in a zone
+- `libdns.RecordAppender` — add records to a zone
+- `libdns.RecordSetter` — create or update records
+- `libdns.RecordDeleter` — delete records
+
+## Supported Record Types
+
+All record types Neoserv supports are handled, including their type-specific fields:
+
+| Type   | Go type          | Extra fields           |
+| ------ | ---------------- | ---------------------- |
+| A/AAAA | `libdns.Address` | —                      |
+| CNAME  | `libdns.CNAME`   | —                      |
+| NS     | `libdns.NS`      | —                      |
+| TXT    | `libdns.TXT`     | —                      |
+| MX     | `libdns.MX`      | preference             |
+| SRV    | `libdns.SRV`     | priority, weight, port |
+| CAA    | `libdns.CAA`     | flags, tag             |
+| ALIAS  | `neoserv.ALIAS`  | —                      |
+
+`ALIAS` has no `libdns` equivalent, so this package provides its own `neoserv.ALIAS`
+type — an apex-capable, CNAME-like record. It satisfies `libdns.Record` and works
+with all of the provider's record methods just like the built-in types.
+
 ## Supported TTL Values
 
 Neoserv only supports specific TTL values. Check the `provider.go` file for the list of supported TTL values.
