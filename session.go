@@ -96,8 +96,12 @@ func (p *Provider) saveCachedSession() error {
 // It makes a cheap request that Laravel redirects to /login when the session is
 // missing or expired, so it never touches the rate-limited login endpoint. It
 // uses retryTransport rather than doWithRetry so it cannot trigger (and recurse
-// into) session-refresh handling.
+// into) session-refresh handling. Returns false immediately when ctx is already
+// done so callers do not mistake a cancellation for an expired session.
 func (p *Provider) sessionValid(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlServices, nil)
 	if err != nil {
 		return false

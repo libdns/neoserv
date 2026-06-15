@@ -250,6 +250,9 @@ func (p *Provider) refreshSession(ctx context.Context) error {
 	if p.sessionValid(ctx) {
 		return nil
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return p.login(ctx)
 }
 
@@ -264,21 +267,27 @@ func (p *Provider) isAuthenticated() bool {
 }
 
 // authenticate ensures the provider is logged in to moj.neoserv.si.
-// Expects the caller to hold the mutex.
+// p.mutex is held only for the fast init step; the network-bound session check
+// and login run under authMu so the mutex is never held across I/O.
 func (p *Provider) authenticate(ctx context.Context) error {
-	if err := p.init(); err != nil {
+	p.mutex.Lock()
+	err := p.init()
+	p.mutex.Unlock()
+	if err != nil {
 		return fmt.Errorf("failed to initialize provider: %w", err)
 	}
 
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
 	if p.isAuthenticated() {
 		return nil
 	}
-
-	// Before logging in, try to reuse an existing session to avoid the login rate limit.
 	if p.reuseSession(ctx) {
 		return nil
 	}
-
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return p.login(ctx)
 }
 
@@ -356,7 +365,6 @@ type domainEntry struct {
 }
 
 // fetchDomains returns all domains visible on the services page.
-// Expects the caller to hold the mutex and to have authenticated.
 func (p *Provider) fetchDomains(ctx context.Context) ([]domainEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlServices, nil)
 	if err != nil {
@@ -407,11 +415,8 @@ func (p *Provider) fetchDomains(ctx context.Context) ([]domainEntry, error) {
 }
 
 // getZoneID returns the numeric cart ID for the given zone name.
-// Results are cached. Expects no mutex held by the caller.
+// Results are cached; p.mutex is held only for the fast cache reads/writes.
 func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	if err := p.authenticate(ctx); err != nil {
 		return "", fmt.Errorf("failed to get zone ID: %w", err)
 	}
@@ -419,7 +424,11 @@ func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
 	// Normalize the cache key so "example.com" and "example.com." don't produce
 	// two entries (and two fetchDomains round-trips) for the same zone.
 	zoneName := strings.TrimSuffix(zone, ".")
-	if id, ok := p.zoneIdCache[zoneName]; ok {
+
+	p.mutex.Lock()
+	id, ok := p.zoneIdCache[zoneName]
+	p.mutex.Unlock()
+	if ok {
 		return id, nil
 	}
 
@@ -430,7 +439,9 @@ func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
 
 	for _, d := range domains {
 		if strings.EqualFold(d.name, zoneName) {
+			p.mutex.Lock()
 			p.zoneIdCache[zoneName] = d.id
+			p.mutex.Unlock()
 			return d.id, nil
 		}
 	}
@@ -438,11 +449,7 @@ func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
 }
 
 // listZones returns all zones available to the account.
-// Expects no mutex held by the caller.
 func (p *Provider) listZones(ctx context.Context) ([]libdns.Zone, error) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	if err := p.authenticate(ctx); err != nil {
 		return nil, fmt.Errorf("failed to list zones: %w", err)
 	}

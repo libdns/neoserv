@@ -54,28 +54,28 @@ type Provider struct {
 	// authMu serializes re-authentication when an in-flight request finds the
 	// session expired, so concurrent callers do not all log in at once.
 	authMu sync.Mutex
-	// zoneLocks holds a per-zone mutex used to serialize the read-modify-write
-	// sequences in the mutating record methods, so concurrent callers do not
-	// corrupt each other's view of the zone.
-	zoneLocks map[string]*sync.Mutex
+	// zoneLocks holds a per-zone semaphore (buffered channel of size 1) that
+	// serializes the read-modify-write sequences in the mutating record methods,
+	// so concurrent callers do not corrupt each other's view of the zone.
+	// Using a channel instead of a sync.Mutex allows acquisition to be
+	// cancelled via context.
+	zoneLocks map[string]chan struct{}
 }
 
-// zoneLock returns the mutex dedicated to the given zone, creating it on first
-// use. Different zones get independent locks so unrelated zones are not
-// serialized against each other.
-func (p *Provider) zoneLock(zone string) *sync.Mutex {
+// zoneLock returns the semaphore channel dedicated to the given zone, creating
+// it on first use. Different zones get independent semaphores so unrelated zones
+// are not serialized against each other.
+func (p *Provider) zoneLock(zone string) chan struct{} {
 	key := strings.TrimSuffix(zone, ".")
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	if p.zoneLocks == nil {
-		p.zoneLocks = make(map[string]*sync.Mutex)
+		p.zoneLocks = make(map[string]chan struct{})
 	}
-	lk := p.zoneLocks[key]
-	if lk == nil {
-		lk = &sync.Mutex{}
-		p.zoneLocks[key] = lk
+	if p.zoneLocks[key] == nil {
+		p.zoneLocks[key] = make(chan struct{}, 1)
 	}
-	return lk
+	return p.zoneLocks[key]
 }
 
 // Neoserv API does not support all TTL values. The following are the supported TTL values.
@@ -138,8 +138,12 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 // always created anew.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	lock := p.zoneLock(zone)
-	lock.Lock()
-	defer lock.Unlock()
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-lock }()
 	return p.appendRecords(ctx, zone, records)
 }
 
@@ -224,8 +228,12 @@ func (p *Provider) appendRecords(ctx context.Context, zone string, records []lib
 // zone partially modified.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	lock := p.zoneLock(zone)
-	lock.Lock()
-	defer lock.Unlock()
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-lock }()
 
 	for _, record := range records {
 		if _, err := p.getRecordTTL(record.RR().TTL); err != nil {
@@ -347,8 +355,12 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 // record ID), that ID is used to target exactly one record instead.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	lock := p.zoneLock(zone)
-	lock.Lock()
-	defer lock.Unlock()
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-lock }()
 
 	current, err := p.getRecords(ctx, zone)
 	if err != nil {
