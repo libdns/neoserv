@@ -3,6 +3,7 @@ package neoserv
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -55,25 +56,30 @@ func TestAuthenticateCorrect(t *testing.T) {
 	if len(cookies) == 0 {
 		t.Fatal("no cookies set")
 	}
-	var avt12 *http.Cookie
+	var session *http.Cookie
 	for _, cookie := range cookies {
-		if cookie.Name == "avt12" {
-			avt12 = cookie
+		if cookie.Name == "moj_session" {
+			session = cookie
 			break
 		}
 	}
 
-	if avt12 == nil {
-		t.Fatal("avt12 cookie not set")
+	if session == nil {
+		t.Fatal("moj_session cookie not set")
 	}
 
 	t.Logf("Authenticated as %s", username)
-	t.Logf("avt12 cookie: %s", avt12)
+	t.Logf("moj_session cookie: %s", session)
 }
 
 func TestAuthenticateIncorrect(t *testing.T) {
-	provider.Password = "incorrect"
-	err := provider.authenticate(ctx)
+	// Use a dedicated provider so the shared one keeps its valid session and
+	// correct credentials for the remaining tests.
+	bad := Provider{Username: username, Password: "incorrect"}
+	if err := bad.init(); err != nil {
+		t.Fatal(err)
+	}
+	err := bad.authenticate(ctx)
 	if err == nil {
 		t.Fatal("authentication succeeded with incorrect password")
 	}
@@ -103,6 +109,28 @@ func TestGetZoneIDNotFound(t *testing.T) {
 	}
 
 	t.Logf("getZoneID failed as expected: %s", err)
+}
+
+func TestListZones(t *testing.T) {
+	zones, err := provider.ListZones(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(zones) == 0 {
+		t.Fatal("no zones found")
+	}
+
+	want := strings.TrimSuffix(zone, ".")
+	found := false
+	for _, z := range zones {
+		t.Logf("Zone: %s", z.Name)
+		if strings.TrimSuffix(z.Name, ".") == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected zone %s in list", zone)
+	}
 }
 
 func TestGetRecords(t *testing.T) {
@@ -157,18 +185,8 @@ func TestSetInvalidTTLtoValid(t *testing.T) {
 
 func TestAddRecordsInvalidTTL(t *testing.T) {
 	records := []libdns.Record{
-		{
-			Type:  "A",
-			Name:  "valid",
-			Value: "127.0.0.1",
-			TTL:   TTL12h,
-		},
-		{
-			Type:  "A",
-			Name:  "invalid",
-			Value: "127.0.0.1",
-			TTL:   69 * time.Second,
-		},
+		libdns.Address{Name: "valid", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL12h},
+		libdns.Address{Name: "invalid", IP: netip.MustParseAddr("127.0.0.1"), TTL: 69 * time.Second},
 	}
 	provider.UnsupportedTTLisError = true
 	_, err := provider.AppendRecords(ctx, zone, records)
@@ -184,24 +202,9 @@ func TestAddRecordsInvalidTTL(t *testing.T) {
 
 func TestAddRecords(t *testing.T) {
 	records := []libdns.Record{
-		{
-			Type:  "A",
-			Name:  "test",
-			Value: "127.0.0.1",
-			TTL:   TTL1m,
-		},
-		{
-			Type:  "A",
-			Name:  "test2",
-			Value: "127.0.0.2",
-			TTL:   TTL1m,
-		},
-		{
-			Type:  "A",
-			Name:  "test",
-			Value: "127.0.0.1",
-			TTL:   TTL1m,
-		},
+		libdns.Address{Name: "test", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
+		libdns.Address{Name: "test2", IP: netip.MustParseAddr("127.0.0.2"), TTL: TTL1m},
+		libdns.Address{Name: "test", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
 	}
 
 	added, err := provider.AppendRecords(ctx, zone, records)
@@ -214,28 +217,23 @@ func TestAddRecords(t *testing.T) {
 	}
 
 	for i, record := range added {
-		if record.ID == "" {
-			t.Fatalf("record %s ID not set", record.Name)
+		if recordID(record) == "" {
+			t.Fatalf("record %s ID not set", record.RR().Name)
 		}
 
-		if !sameRecord(&record, &records[i]) {
+		if !sameRecord(record, records[i]) {
 			t.Fatalf("expected %v, got %v", records[i], record)
 		}
 	}
 
-	if added[0].ID == added[2].ID {
-		t.Fatalf("expected IDs to be different, got %s", added[0].ID)
+	if recordID(added[0]) == recordID(added[2]) {
+		t.Fatalf("expected IDs to be different, got %s", recordID(added[0]))
 	}
 }
 
 func TestDeleteRecords(t *testing.T) {
 	newRecords := []libdns.Record{
-		{
-			Type:  "A",
-			Name:  "test",
-			Value: "127.0.0.1",
-			TTL:   TTL1m,
-		},
+		libdns.Address{Name: "test", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
 	}
 
 	added, err := provider.AppendRecords(ctx, zone, newRecords)
@@ -248,7 +246,7 @@ func TestDeleteRecords(t *testing.T) {
 	}
 	foundInRecords := false
 	for _, record := range records {
-		if record.ID == added[0].ID {
+		if recordID(record) == recordID(added[0]) {
 			foundInRecords = true
 			break
 		}
@@ -265,8 +263,8 @@ func TestDeleteRecords(t *testing.T) {
 	if len(deleted) != len(added) {
 		t.Fatalf("expected %d records to be deleted, got %d", len(added), len(deleted))
 	}
-	if deleted[0].ID != added[0].ID {
-		t.Fatalf("expected ID %s, got %s", added[0].ID, deleted[0].ID)
+	if recordID(deleted[0]) != recordID(added[0]) {
+		t.Fatalf("expected ID %s, got %s", recordID(added[0]), recordID(deleted[0]))
 	}
 
 	records, err = provider.GetRecords(ctx, zone)
@@ -275,7 +273,7 @@ func TestDeleteRecords(t *testing.T) {
 	}
 	foundInRecords = false
 	for _, record := range records {
-		if record.ID == added[0].ID {
+		if recordID(record) == recordID(added[0]) {
 			foundInRecords = true
 			break
 		}
@@ -287,12 +285,11 @@ func TestDeleteRecords(t *testing.T) {
 
 func TestDeleteNonexistentRecords(t *testing.T) {
 	records := []libdns.Record{
-		{
-			ID:    "000000",
-			Type:  "A",
-			Name:  "nonexistent",
-			Value: "127.0.0.1",
-			TTL:   TTL1m,
+		libdns.Address{
+			Name:         "nonexistent",
+			IP:           netip.MustParseAddr("127.0.0.1"),
+			TTL:          TTL1m,
+			ProviderData: "000000",
 		},
 	}
 
@@ -316,41 +313,25 @@ func TestUpdateRecords(t *testing.T) {
 
 	var toEditID string
 	for _, record := range records {
-		if record.Name == "test" {
-			toEditID = record.ID
+		if record.RR().Name == "test" {
+			toEditID = recordID(record)
 			break
 		}
 	}
 
 	if toEditID == "" {
 		newr, err := provider.AppendRecords(ctx, zone, []libdns.Record{
-			{
-				Type:  "A",
-				Name:  "test",
-				Value: "127.0.0.1",
-				TTL:   TTL1m,
-			},
+			libdns.Address{Name: "test", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		toEditID = newr[0].ID
+		toEditID = recordID(newr[0])
 	}
 
 	newRecords := []libdns.Record{
-		{
-			Type:  "A",
-			Name:  "test-created",
-			Value: "127.0.0.1",
-			TTL:   TTL1m,
-		},
-		{
-			ID:    toEditID,
-			Type:  "A",
-			Name:  "test-edited",
-			Value: "127.0.0.1",
-			TTL:   TTL5m,
-		},
+		libdns.Address{Name: "test-created", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
+		libdns.Address{Name: "test-edited", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL5m, ProviderData: toEditID},
 	}
 
 	updated, err := provider.SetRecords(ctx, zone, newRecords)
@@ -363,7 +344,7 @@ func TestUpdateRecords(t *testing.T) {
 	}
 
 	for i, record := range updated {
-		if !sameRecord(&record, &newRecords[i]) {
+		if !sameRecord(record, newRecords[i]) {
 			t.Fatalf("expected %v, got %v", newRecords[i], record)
 		}
 	}
@@ -377,7 +358,7 @@ func TestDeleteTestingRecords(t *testing.T) {
 
 	toDelete := make([]libdns.Record, 0)
 	for _, record := range records {
-		if strings.HasPrefix(record.Name, "test") {
+		if strings.HasPrefix(record.RR().Name, "test") {
 			toDelete = append(toDelete, record)
 		}
 	}
@@ -396,7 +377,7 @@ func TestDeleteTestingRecords(t *testing.T) {
 	}
 
 	for i, record := range deleted {
-		if !sameRecord(&record, &toDelete[i]) {
+		if !sameRecord(record, toDelete[i]) {
 			t.Fatalf("expected %v, got %v", toDelete[i], record)
 		}
 	}

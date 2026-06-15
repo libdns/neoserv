@@ -1,9 +1,6 @@
 Neoserv for [`libdns`](https://github.com/libdns/libdns)
 =======================
 
-> [!WARNING]
-> This package is outdate since Neoserv has changed their web interface and is no longer working. PRs to update the package are welcome.
-
 [![Go Reference](https://pkg.go.dev/badge/test.svg)](https://pkg.go.dev/github.com/libdns/neoserv)
 
 This package implements the [libdns interfaces](https://github.com/libdns/libdns) for [Neoserv](https://moj.neoserv.si), allowing you to manage DNS records.
@@ -26,20 +23,7 @@ NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password NEOSERV_ZONE=your
 
 ## Supported TTL Values
 
-Neoserv only supports specific TTL values. The following are the supported TTL values:
-
-- 1 minute
-- 5 minutes
-- 15 minutes
-- 30 minutes
-- 1 hour
-- 6 hours
-- 12 hours
-- 24 hours (1 day)
-- 2 days
-- 7 days
-- 14 days
-- 30 days
+Neoserv only supports specific TTL values. Check the `provider.go` file for the list of supported TTL values.
 
 By default, if an unsupported TTL is provided, the provider will use the closest supported value that is greater than or equal to the provided value. If you want to treat unsupported TTL values as errors, set `UnsupportedTTLisError` to `true` when creating the provider:
 

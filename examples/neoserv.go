@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 
 	"github.com/libdns/libdns"
@@ -36,21 +37,34 @@ func main() {
 	}
 
 	for _, record := range records {
-		fmt.Printf("%s (ID: %s): %s, %s, TTL: %s\n", record.Name, record.ID, record.Type, record.Value, record.TTL.String())
+		rr := record.RR()
+		fmt.Printf("%s (ID: %s): %s, %s, TTL: %s\n", rr.Name, neoserv.RecordID(record), rr.Type, rr.Data, rr.TTL.String())
 	}
 
 	// Add a new record
 	newRecords, err := provider.AppendRecords(context.TODO(), zone, []libdns.Record{
-		{
-			Type:  "TXT",
-			Name:  "test",
-			Value: "This is a test",
-			TTL:   neoserv.TTL12h, // Neoserv supports specific TTL values
+		libdns.TXT{
+			Name: "test",
+			Text: "This is a test",
+			TTL:  neoserv.TTL12h, // Neoserv supports specific TTL values
 		},
 	})
 	if err != nil {
 		fmt.Printf("ERROR: %s\n", err.Error())
 	}
 
-	fmt.Printf("Added: %v\n", newRecords)
+	// Add an A record
+	aRecords, err := provider.AppendRecords(context.TODO(), zone, []libdns.Record{
+		libdns.Address{
+			Name: "test",
+			IP:   netip.MustParseAddr("127.0.0.1"),
+			TTL:  neoserv.TTL12h,
+		},
+	})
+	if err != nil {
+		fmt.Printf("ERROR: %s\n", err.Error())
+	}
+
+	fmt.Printf("Added TXT: %v\n", newRecords)
+	fmt.Printf("Added A: %v\n", aRecords)
 }
