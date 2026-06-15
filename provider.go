@@ -186,9 +186,17 @@ func (p *Provider) appendRecords(ctx context.Context, zone string, records []lib
 	}
 
 	for i, appendedRecord := range appendedRecords {
+		// Match against the record as it was actually stored: createRecord writes
+		// the normalized TTL, so compare with that rather than the raw input TTL,
+		// which may differ (e.g. an input TTL of 0 is bumped to the smallest valid
+		// value) and would otherwise never match.
+		want := appendedRecord.RR()
+		if normTTL, err := p.getRecordTTL(want.TTL); err == nil {
+			want.TTL = normTTL
+		}
 		matchingIdx := -1
 		for j, newRecord := range newRecords {
-			if sameRecord(appendedRecord, newRecord) {
+			if sameRecord(want, newRecord) {
 				matchingIdx = j
 				break
 			}
@@ -289,7 +297,10 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			if next < len(leftoverExisting) {
 				e := existing[leftoverExisting[next]]
 				next++
-				updated := withRecordID(it.rec, recordID(e))
+				// Report the record with the TTL that is actually stored (TTLs
+				// were validated up front, so this never errors here).
+				normTTL, _ := p.getRecordTTL(it.rec.RR().TTL)
+				updated := recordWithIDAndTTL(it.rec, recordID(e), normTTL)
 				if err := p.updateRecord(ctx, zone, updated); err != nil {
 					return nil, fmt.Errorf("failed to set records: %w", err)
 				}

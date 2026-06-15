@@ -416,7 +416,10 @@ func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
 		return "", fmt.Errorf("failed to get zone ID: %w", err)
 	}
 
-	if id, ok := p.zoneIdCache[zone]; ok {
+	// Normalize the cache key so "example.com" and "example.com." don't produce
+	// two entries (and two fetchDomains round-trips) for the same zone.
+	zoneName := strings.TrimSuffix(zone, ".")
+	if id, ok := p.zoneIdCache[zoneName]; ok {
 		return id, nil
 	}
 
@@ -425,10 +428,9 @@ func (p *Provider) getZoneID(ctx context.Context, zone string) (string, error) {
 		return "", fmt.Errorf("failed to get zone ID: %w", err)
 	}
 
-	zoneName := strings.TrimSuffix(zone, ".")
 	for _, d := range domains {
 		if strings.EqualFold(d.name, zoneName) {
-			p.zoneIdCache[zone] = d.id
+			p.zoneIdCache[zoneName] = d.id
 			return d.id, nil
 		}
 	}
@@ -630,8 +632,7 @@ func snapshotRecordToLibdns(r snapshotRecordData) (libdns.Record, error) {
 	case "CNAME":
 		return libdns.CNAME{Name: name, TTL: ttl, Target: r.Record, ProviderData: id}, nil
 	case "MX":
-		prio := parsePriorityRaw(r.Priority)
-		return libdns.MX{Name: name, TTL: ttl, Preference: prio, Target: r.Record, ProviderData: id}, nil
+		return libdns.MX{Name: name, TTL: ttl, Preference: uint16(parseIntRaw(r.Priority)), Target: r.Record, ProviderData: id}, nil
 	case "SRV":
 		// Neoserv stores the full "_service._transport.name" owner in Host. We keep
 		// Service and Transport empty so SRV.RR() uses Name verbatim, preserving the
@@ -639,9 +640,9 @@ func snapshotRecordToLibdns(r snapshotRecordData) (libdns.Record, error) {
 		return libdns.SRV{
 			Name:         name,
 			TTL:          ttl,
-			Priority:     parsePriorityRaw(r.Priority),
-			Weight:       parsePriorityRaw(r.Weight),
-			Port:         parsePriorityRaw(r.Port),
+			Priority:     uint16(parseIntRaw(r.Priority)),
+			Weight:       uint16(parseIntRaw(r.Weight)),
+			Port:         uint16(parseIntRaw(r.Port)),
 			Target:       r.Record,
 			ProviderData: id,
 		}, nil
@@ -660,14 +661,15 @@ func snapshotRecordToLibdns(r snapshotRecordData) (libdns.Record, error) {
 	}
 }
 
-// libdnsRecordToNeoservForm extracts the form fields needed for create/update Livewire calls.
+// libdnsRecordToNeoservForm extracts the form fields needed for create/update
+// Livewire calls. The TTL is left unset; callers fill it with the normalized
+// value from getRecordTTL.
 func libdnsRecordToNeoservForm(r libdns.Record) neoservForm {
 	rr := r.RR()
 	host := rr.Name
 	if host == "@" {
 		host = ""
 	}
-	ttl := int(rr.TTL.Seconds())
 
 	switch v := r.(type) {
 	case libdns.Address:
@@ -675,58 +677,47 @@ func libdnsRecordToNeoservForm(r libdns.Record) neoservForm {
 		if v.IP.Is6() {
 			recType = "AAAA"
 		}
-		return neoservForm{recordType: recType, host: host, value: v.IP.String(), ttl: ttl}
+		return neoservForm{recordType: recType, host: host, value: v.IP.String()}
 	case libdns.CNAME:
-		return neoservForm{recordType: "CNAME", host: host, value: v.Target, ttl: ttl}
+		return neoservForm{recordType: "CNAME", host: host, value: v.Target}
 	case libdns.MX:
-		return neoservForm{recordType: "MX", host: host, value: v.Target, ttl: ttl, priority: int(v.Preference)}
+		return neoservForm{recordType: "MX", host: host, value: v.Target, priority: int(v.Preference)}
 	case libdns.SRV:
-		return neoservForm{recordType: "SRV", host: host, value: v.Target, ttl: ttl, priority: int(v.Priority), weight: int(v.Weight), port: int(v.Port)}
+		return neoservForm{recordType: "SRV", host: host, value: v.Target, priority: int(v.Priority), weight: int(v.Weight), port: int(v.Port)}
 	case libdns.NS:
-		return neoservForm{recordType: "NS", host: host, value: v.Target, ttl: ttl}
+		return neoservForm{recordType: "NS", host: host, value: v.Target}
 	case ALIAS:
-		return neoservForm{recordType: "ALIAS", host: host, value: v.Target, ttl: ttl}
+		return neoservForm{recordType: "ALIAS", host: host, value: v.Target}
 	case libdns.TXT:
-		return neoservForm{recordType: "TXT", host: host, value: v.Text, ttl: ttl}
+		return neoservForm{recordType: "TXT", host: host, value: v.Text}
 	case libdns.CAA:
-		return neoservForm{recordType: "CAA", host: host, value: v.Value, ttl: ttl, caaFlag: int(v.Flags), caaType: v.Tag}
+		return neoservForm{recordType: "CAA", host: host, value: v.Value, caaFlag: int(v.Flags), caaType: v.Tag}
 	default:
-		return neoservForm{recordType: rr.Type, host: host, value: rr.Data, ttl: ttl}
+		return neoservForm{recordType: rr.Type, host: host, value: rr.Data}
 	}
+}
+
+// parseIntRaw decodes a Livewire numeric field, which may be encoded as either a
+// JSON number or a JSON string. It returns 0 when the value is absent or not numeric.
+func parseIntRaw(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if n, err := strconv.Atoi(s); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func parseTTLRaw(raw json.RawMessage) time.Duration {
-	if len(raw) == 0 {
-		return 0
-	}
-	var n int
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return time.Duration(n) * time.Second
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		if n, err := strconv.Atoi(s); err == nil {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 0
-}
-
-func parsePriorityRaw(raw json.RawMessage) uint16 {
-	if len(raw) == 0 {
-		return 0
-	}
-	var n int
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return uint16(n)
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		if n, err := strconv.Atoi(s); err == nil {
-			return uint16(n)
-		}
-	}
-	return 0
+	return time.Duration(parseIntRaw(raw)) * time.Second
 }
 
 // createRecord adds a new record via the add-domain-record-dialog Livewire component.
@@ -743,7 +734,7 @@ func (p *Provider) createRecord(ctx context.Context, zone string, record libdns.
 
 	dialogSnapshots := page.byName["cart.domain.create-dns-record-dialog"]
 	if len(dialogSnapshots) == 0 {
-		return fmt.Errorf("failed to create record: add-domain-record-dialog snapshot not found")
+		return fmt.Errorf("failed to create record: create-dns-record-dialog snapshot not found")
 	}
 
 	form := libdnsRecordToNeoservForm(record)
@@ -962,39 +953,38 @@ func recordMatches(input, cur libdns.Record) bool {
 	return true
 }
 
-// withRecordID returns a copy of r with its ProviderData set to id, preserving
-// the concrete record type so later conversions remain type-aware.
-func withRecordID(r libdns.Record, id string) libdns.Record {
+// recordWithIDAndTTL returns a copy of r with its provider record ID set to id
+// and its TTL set to ttl, preserving the concrete record type so later
+// conversions remain type-aware. SetRecords uses it to report an in-place update
+// with the reused record's ID and the actual (normalized) TTL that was stored.
+func recordWithIDAndTTL(r libdns.Record, id string, ttl time.Duration) libdns.Record {
 	switch v := r.(type) {
 	case libdns.Address:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case libdns.CNAME:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case libdns.MX:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case libdns.NS:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case libdns.TXT:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case libdns.SRV:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case libdns.CAA:
-		v.ProviderData = id
-		return v
-	case libdns.ServiceBinding:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case ALIAS:
-		v.ProviderData = id
+		v.ProviderData, v.TTL = id, ttl
 		return v
 	case unknownRecord:
-		v.providerData = id
+		v.providerData, v.ttl = id, ttl
 		return v
 	}
 	return r
@@ -1022,9 +1012,6 @@ func recordID(r libdns.Record) string {
 		s, _ := v.ProviderData.(string)
 		return s
 	case libdns.CAA:
-		s, _ := v.ProviderData.(string)
-		return s
-	case libdns.ServiceBinding:
 		s, _ := v.ProviderData.(string)
 		return s
 	case ALIAS:

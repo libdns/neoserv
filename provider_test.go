@@ -666,6 +666,107 @@ func TestSetRecordsUpdateAndAdd(t *testing.T) {
 	}
 }
 
+// TestAppendNonCanonicalTTL is a regression test for the append path: matching a
+// created record back against the zone used to compare the raw input TTL, which
+// never equals the normalized TTL that Neoserv actually stores, so appending with
+// an unsupported TTL (such as the zero value) failed even though the create
+// succeeded. It verifies the append succeeds and that the returned and stored
+// records carry the normalized TTL.
+func TestAppendNonCanonicalTTL(t *testing.T) {
+	provider.UnsupportedTTLisError = false
+
+	// TTL 0 (the zero value) is bumped up to the smallest supported value, TTL1m.
+	added, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-ttl-append", IP: netip.MustParseAddr("203.0.113.20"), TTL: 0},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(added) != 1 {
+		t.Fatalf("expected 1 record added, got %d", len(added))
+	}
+	defer provider.DeleteRecords(ctx, zone, added)
+
+	if recordID(added[0]) == "" {
+		t.Fatal("appended record has no ID")
+	}
+	if added[0].RR().TTL != TTL1m {
+		t.Fatalf("expected normalized TTL %s in result, got %s", TTL1m, added[0].RR().TTL)
+	}
+
+	records, err := provider.GetRecords(ctx, zone)
+	if err != nil {
+		t.Fatalf("get records: %v", err)
+	}
+	var found libdns.Record
+	for _, r := range records {
+		if recordID(r) == recordID(added[0]) {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("record not found after append")
+	}
+	if found.RR().TTL != TTL1m {
+		t.Fatalf("expected stored TTL %s, got %s", TTL1m, found.RR().TTL)
+	}
+}
+
+// TestSetRecordsNormalizesTTL verifies that when SetRecords updates a record in
+// place with a non-canonical TTL, it stores and reports the normalized TTL while
+// preserving the record's ID.
+func TestSetRecordsNormalizesTTL(t *testing.T) {
+	provider.UnsupportedTTLisError = false
+
+	add, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-ttl-set", IP: netip.MustParseAddr("203.0.113.21"), TTL: TTL1h},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	defer provider.DeleteRecords(ctx, zone, []libdns.Record{libdns.RR{Name: "test-ttl-set"}})
+
+	// A new value with a non-canonical TTL (0 -> TTL1m) forces an in-place update
+	// rather than an exact-match keep.
+	set, err := provider.SetRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-ttl-set", IP: netip.MustParseAddr("203.0.113.22"), TTL: 0},
+	})
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if len(set) != 1 {
+		t.Fatalf("expected 1 record set, got %d", len(set))
+	}
+	if set[0].RR().TTL != TTL1m {
+		t.Fatalf("expected reported TTL %s, got %s", TTL1m, set[0].RR().TTL)
+	}
+	if recordID(set[0]) != recordID(add[0]) {
+		t.Fatalf("expected in-place update to keep ID %s, got %s", recordID(add[0]), recordID(set[0]))
+	}
+
+	records, err := provider.GetRecords(ctx, zone)
+	if err != nil {
+		t.Fatalf("get records: %v", err)
+	}
+	var found libdns.Record
+	for _, r := range records {
+		if r.RR().Name == "test-ttl-set" && r.RR().Type == "A" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("record not found after set")
+	}
+	if found.RR().TTL != TTL1m {
+		t.Fatalf("expected stored TTL %s, got %s", TTL1m, found.RR().TTL)
+	}
+	if found.RR().Data != "203.0.113.22" {
+		t.Fatalf("expected updated data 203.0.113.22, got %s", found.RR().Data)
+	}
+}
+
 func TestDeleteTestingRecords(t *testing.T) {
 	records, err := provider.GetRecords(ctx, zone)
 	if err != nil {
