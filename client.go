@@ -166,6 +166,11 @@ func (p *Provider) authenticate(ctx context.Context) error {
 		return nil
 	}
 
+	// Before logging in, try to reuse an existing session to avoid the login rate limit.
+	if p.reuseSession(ctx) {
+		return nil
+	}
+
 	// Step 1: GET /login to collect cookies and the CSRF token.
 	loginResp, err := p.client.Get(urlLogin)
 	if err != nil {
@@ -205,6 +210,11 @@ func (p *Provider) authenticate(ctx context.Context) error {
 	// Laravel redirects back to /login on bad credentials; any other path means success.
 	if strings.HasSuffix(resp.Request.URL.Path, "/login") {
 		return fmt.Errorf("authentication failed")
+	}
+
+	// Persist the fresh session so later runs can skip the login.
+	if !p.DisableSessionCache {
+		_ = p.saveCachedSession()
 	}
 	return nil
 }

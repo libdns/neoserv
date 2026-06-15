@@ -50,6 +50,26 @@ All record types Neoserv supports are handled, including their type-specific fie
 type — an apex-capable, CNAME-like record. It satisfies `libdns.Record` and works
 with all of the provider's record methods just like the built-in types.
 
+## Session Caching
+
+Neoserv rate-limits the login endpoint, which is easy to hit while developing or
+running the test suite. To avoid this, the provider reuses an existing session
+instead of logging in on every run. On a successful login the `moj_session` cookie
+is persisted to disk and reused (after a cheap validity check) until it expires;
+only when no valid cached session exists does the provider log in again.
+
+By default the cache lives in a per-account file in the OS temp directory. You can
+point it elsewhere, or opt out of disk caching entirely:
+
+```go
+provider := neoserv.Provider{
+	Username:            "your-neoserv-email",
+	Password:            "your-neoserv-password",
+	SessionCachePath:    "/path/to/session.json", // optional; default is a temp file
+	DisableSessionCache: true,                     // opt out of on-disk caching
+}
+```
+
 ## Supported TTL Values
 
 Neoserv only supports specific TTL values. Check the `provider.go` file for the list of supported TTL values.

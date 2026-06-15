@@ -74,8 +74,10 @@ func TestAuthenticateCorrect(t *testing.T) {
 
 func TestAuthenticateIncorrect(t *testing.T) {
 	// Use a dedicated provider so the shared one keeps its valid session and
-	// correct credentials for the remaining tests.
-	bad := Provider{Username: username, Password: "incorrect"}
+	// correct credentials for the remaining tests. DisableSessionCache forces
+	// the login path; otherwise the cached valid session (keyed by the shared
+	// username) would be reused and the wrong password never exercised.
+	bad := Provider{Username: username, Password: "incorrect", DisableSessionCache: true}
 	if err := bad.init(); err != nil {
 		t.Fatal(err)
 	}

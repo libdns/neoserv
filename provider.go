@@ -25,6 +25,15 @@ type Provider struct {
 	// value.
 	UnsupportedTTLisError bool `json:"unsupported_ttl_is_error,omitempty"`
 
+	// SessionCachePath is the file used to persist the login session cookie between
+	// runs, which avoids Neoserv's login rate limit. When empty, a per-account file
+	// in the OS temp directory is used. Ignored when DisableSessionCache is true.
+	SessionCachePath string `json:"session_cache_path,omitempty"`
+
+	// DisableSessionCache opts out of persisting and reusing the login session on
+	// disk. When true, the provider always logs in with the username and password.
+	DisableSessionCache bool `json:"disable_session_cache,omitempty"`
+
 	// client is the HTTP client used to communicate with the Neoserv API.
 	client *http.Client
 	// zoneIdCache is a map of zone names to their corresponding zone IDs.
