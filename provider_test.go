@@ -2,6 +2,7 @@ package neoserv
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/netip"
 	"os"
@@ -85,11 +86,77 @@ func TestAuthenticateIncorrect(t *testing.T) {
 	if err == nil {
 		t.Fatal("authentication succeeded with incorrect password")
 	}
+	if errors.Is(err, ErrLoginRateLimited) {
+		t.Skipf("login rate limited; cannot exercise the incorrect-password path: %s", err)
+	}
 	if !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("expected 'authentication failed', got %s", err)
 	}
 
 	t.Logf("Authentication failed as expected: %s", err)
+}
+
+// TestSessionExpiryRecovery simulates an expired session by replacing the
+// session cookie with a bogus value (which still passes the in-memory
+// isAuthenticated check), then confirms that a normal data request transparently
+// re-authenticates and succeeds instead of looping or failing.
+//
+// It uses a dedicated provider so corrupting the session cannot disturb the
+// shared provider used by the other tests. The dedicated provider authenticates
+// from the shared on-disk cache, so it does not require a login of its own.
+func TestSessionExpiryRecovery(t *testing.T) {
+	p := Provider{Username: username, Password: password}
+	if err := p.init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.authenticate(ctx); err != nil {
+		if errors.Is(err, ErrLoginRateLimited) {
+			t.Skipf("login rate limited; cannot set up session recovery test: %s", err)
+		}
+		t.Fatal(err)
+	}
+	// Warm the zone-ID cache so the expiry is exercised on the records-page fetch.
+	if _, err := p.GetRecords(ctx, zone); err != nil {
+		t.Fatal(err)
+	}
+	p.setSessionCookie("bogus-expired-session-value")
+
+	records, err := p.GetRecords(ctx, zone)
+	if errors.Is(err, ErrLoginRateLimited) {
+		t.Skipf("login rate limited; cannot exercise session recovery: %s", err)
+	}
+	if err != nil {
+		t.Fatalf("expected transparent recovery, got error: %s", err)
+	}
+	if len(records) == 0 {
+		t.Fatal("no records returned after recovery")
+	}
+	if !p.sessionValid(ctx) {
+		t.Fatal("session not valid after recovery")
+	}
+
+	p.setSessionCookie("bogus-expired-session-value")
+
+	appended, err := p.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-session-recovery", IP: netip.MustParseAddr("203.0.113.10"), TTL: TTL1h},
+	})
+	if errors.Is(err, ErrLoginRateLimited) {
+		t.Skipf("login rate limited; cannot exercise session recovery: %s", err)
+	}
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(appended) != 1 {
+		t.Fatalf("expected 1 record added, got %d", len(appended))
+	}
+	if !p.sessionValid(ctx) {
+		t.Fatal("session not valid after recovery")
+	}
+
+	_, err = p.DeleteRecords(ctx, zone, appended)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
 }
 
 func TestGetZoneID(t *testing.T) {
@@ -362,6 +429,9 @@ func TestDeleteRecords(t *testing.T) {
 	}
 }
 
+// TestDeleteNonexistentRecords verifies the libdns contract that deleting
+// records which are not in the zone is silently ignored (no error, nothing
+// returned), both when targeted by a bogus ID and by content.
 func TestDeleteNonexistentRecords(t *testing.T) {
 	records := []libdns.Record{
 		libdns.Address{
@@ -370,62 +440,229 @@ func TestDeleteNonexistentRecords(t *testing.T) {
 			TTL:          TTL1m,
 			ProviderData: "000000",
 		},
+		libdns.Address{Name: "alsomissing", IP: netip.MustParseAddr("127.0.0.2"), TTL: TTL1m},
 	}
 
 	rec, err := provider.DeleteRecords(ctx, zone, records)
-	if err == nil {
-		t.Fatal("DeleteRecords succeeded with nonexistent record")
+	if err != nil {
+		t.Fatalf("expected nil error for nonexistent records, got %s", err)
 	}
 	if len(rec) != 0 {
 		t.Fatalf("expected 0 records to be deleted, got %d", len(rec))
 	}
-	if !strings.Contains(err.Error(), "record not found") {
-		t.Fatalf("expected 'record not found', got %s", err)
+}
+
+func TestAppendDuplicateCNAME(t *testing.T) {
+	records := []libdns.Record{
+		libdns.CNAME{Name: "test-cname", Target: "example1.com", TTL: TTL1m},
+		libdns.CNAME{Name: "test-cname", Target: "example2.com", TTL: TTL1m},
+	}
+	rec, err := provider.AppendRecords(ctx, zone, records)
+	// Expected: failed to append records: failed to create record: server did not confirm creation
+	if err == nil {
+		t.Fatal("AppendRecords succeeded with duplicate CNAME names")
+	}
+	if !strings.Contains(err.Error(), "failed to create record") {
+		t.Fatalf("expected 'failed to create record', got %s", err)
+	}
+
+	if len(rec) != 1 || rec[0].RR().Data != "example1.com" {
+		t.Fatalf("expected 1 record added with target example1.com, got %v", rec)
+	}
+
+	// Cleanup the one that was added.
+	if _, err := provider.DeleteRecords(ctx, zone, rec); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestUpdateRecords(t *testing.T) {
+// TestDeleteByContent deletes a record identified purely by its content (no
+// ProviderData), and TestDeleteWildcard deletes by name only using an RR with
+// empty type/ttl/value as wildcards.
+func TestDeleteByContent(t *testing.T) {
+	add, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-del", IP: netip.MustParseAddr("203.0.113.5"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.DeleteRecords(ctx, zone, add)
+
+	deleted, err := provider.DeleteRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-del", IP: netip.MustParseAddr("203.0.113.5"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 1 {
+		t.Fatalf("expected 1 record deleted, got %d", len(deleted))
+	}
+	if recordID(deleted[0]) != recordID(add[0]) {
+		t.Fatalf("deleted wrong record: %s vs %s", recordID(deleted[0]), recordID(add[0]))
+	}
+}
+
+func TestDeleteWildcard(t *testing.T) {
+	add, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-wild", IP: netip.MustParseAddr("203.0.113.6"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.DeleteRecords(ctx, zone, add)
+
+	// Name only; empty type/ttl/value act as wildcards.
+	deleted, err := provider.DeleteRecords(ctx, zone, []libdns.Record{
+		libdns.RR{Name: "test-wild"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 1 {
+		t.Fatalf("expected 1 record deleted, got %d", len(deleted))
+	}
+}
+
+// TestSetRecordsReplace verifies the RRset-replacement semantics of SetRecords:
+// after the call, the only records for an input (name, type) pair are those
+// provided, so pre-existing siblings are removed.
+func TestSetRecordsReplace(t *testing.T) {
+	_, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.1"), TTL: TTL1m},
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.2"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set, err := provider.SetRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.3"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set) != 1 || set[0].RR().Data != "203.0.113.3" {
+		t.Fatalf("unexpected set result: %v", set)
+	}
+
 	records, err := provider.GetRecords(ctx, zone)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	var toEditID string
-	for _, record := range records {
-		if record.RR().Name == "test" {
-			toEditID = recordID(record)
-			break
+	var got []string
+	for _, r := range records {
+		if r.RR().Name == "test-set" && r.RR().Type == "A" {
+			got = append(got, r.RR().Data)
 		}
 	}
-
-	if toEditID == "" {
-		newr, err := provider.AppendRecords(ctx, zone, []libdns.Record{
-			libdns.Address{Name: "test", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		toEditID = recordID(newr[0])
+	if len(got) != 1 || got[0] != "203.0.113.3" {
+		t.Fatalf("expected only [203.0.113.3] for test-set/A, got %v", got)
 	}
 
-	newRecords := []libdns.Record{
-		libdns.Address{Name: "test-created", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL1m},
-		libdns.Address{Name: "test-edited", IP: netip.MustParseAddr("127.0.0.1"), TTL: TTL5m, ProviderData: toEditID},
+	// Cleanup.
+	if _, err := provider.DeleteRecords(ctx, zone, []libdns.Record{libdns.RR{Name: "test-set"}}); err != nil {
+		t.Fatal(err)
 	}
+}
 
-	updated, err := provider.SetRecords(ctx, zone, newRecords)
+func TestSetRecordsReplaceMultiple(t *testing.T) {
+	_, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.1"), TTL: TTL1m},
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.2"), TTL: TTL1m},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(updated) != len(newRecords) {
-		t.Fatalf("expected %d records to be updated, got %d", len(newRecords), len(updated))
+	set, err := provider.SetRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.3"), TTL: TTL1m},
+		libdns.Address{Name: "test-set", IP: netip.MustParseAddr("203.0.113.4"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("expected 2 records set, got %d", len(set))
+	}
+	if set[0].RR().Data != "203.0.113.3" || set[1].RR().Data != "203.0.113.4" {
+		t.Fatalf("unexpected set result: %v", set)
 	}
 
-	for i, record := range updated {
-		if !sameRecord(record, newRecords[i]) {
-			t.Fatalf("expected %v, got %v", newRecords[i], record)
+	records, err := provider.GetRecords(ctx, zone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range records {
+		if r.RR().Name == "test-set" && r.RR().Type == "A" {
+			got = append(got, r.RR().Data)
 		}
+	}
+	if len(got) != 2 || got[0] != "203.0.113.3" || got[1] != "203.0.113.4" {
+		t.Fatalf("expected [203.0.113.3 203.0.113.4] for test-set/A, got %v", got)
+	}
+
+	// Cleanup.
+	if _, err := provider.DeleteRecords(ctx, zone, []libdns.Record{libdns.RR{Name: "test-set"}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSetRecordsUpdateAndAdd verifies that SetRecords updates an existing record
+// in place when its (name, type) already exists, and creates records that do not.
+func TestSetRecordsUpdateAndAdd(t *testing.T) {
+	add, err := provider.AppendRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-upd", IP: netip.MustParseAddr("203.0.113.1"), TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set, err := provider.SetRecords(ctx, zone, []libdns.Record{
+		libdns.Address{Name: "test-upd", IP: netip.MustParseAddr("203.0.113.9"), TTL: TTL5m},
+		libdns.TXT{Name: "test-upd", Text: "new", TTL: TTL1m},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("expected 2 records set, got %d", len(set))
+	}
+
+	records, err := provider.GetRecords(ctx, zone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aData, aTTL, txt string
+	aCount := 0
+	for _, r := range records {
+		rr := r.RR()
+		if rr.Name != "test-upd" {
+			continue
+		}
+		switch rr.Type {
+		case "A":
+			aCount++
+			aData = rr.Data
+			aTTL = rr.TTL.String()
+			// The in-place update should preserve the original record ID.
+			if recordID(r) != recordID(add[0]) {
+				t.Fatalf("expected updated A to keep ID %s, got %s", recordID(add[0]), recordID(r))
+			}
+		case "TXT":
+			txt = rr.Data
+		}
+	}
+	if aCount != 1 || aData != "203.0.113.9" || aTTL != TTL5m.String() {
+		t.Fatalf("A not updated in place: count=%d data=%s ttl=%s", aCount, aData, aTTL)
+	}
+	if txt != "new" {
+		t.Fatalf("TXT not created, got %q", txt)
+	}
+
+	// Cleanup.
+	if _, err := provider.DeleteRecords(ctx, zone, []libdns.Record{libdns.RR{Name: "test-upd"}}); err != nil {
+		t.Fatal(err)
 	}
 }
 

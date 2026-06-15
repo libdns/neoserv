@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/netip"
@@ -145,6 +146,113 @@ func (p *Provider) init() error {
 	return nil
 }
 
+// retryTransport sends req, retrying on connection errors and on 429/5xx responses
+// with exponential backoff. It honors context cancellation. Requests with a body
+// must have GetBody set (true for bodies built from bytes/strings readers) so the
+// body can be replayed; this is the case for all requests this package sends.
+//
+// It does not handle session expiry; use doWithRetry for that. The login flow and
+// session validation deliberately use retryTransport so they cannot recurse into
+// re-authentication.
+func (p *Provider) retryTransport(req *http.Request) (*http.Response, error) {
+	const maxAttempts = 4
+	backoff := 200 * time.Millisecond
+
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if req.GetBody != nil {
+				body, berr := req.GetBody()
+				if berr != nil {
+					return nil, berr
+				}
+				req.Body = body
+			}
+		}
+
+		// The http.Client appends jar cookies to req.Header on every Do without
+		// removing previously added ones, so a reused request (a retry here, or a
+		// replay in doWithRetry) would send stale cookies alongside the current
+		// ones. Clear them first so only the jar's current cookies are sent.
+		req.Header.Del("Cookie")
+
+		resp, err = p.client.Do(req)
+		if err == nil && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			return resp, nil
+		}
+		// Give up after the last attempt, returning whatever we have.
+		if attempt < maxAttempts-1 && resp != nil {
+			resp.Body.Close()
+		}
+	}
+	return resp, err
+}
+
+// redirectedToLogin reports whether a response landed on the login page, which is
+// how moj.neoserv.si signals that the session has expired.
+func redirectedToLogin(resp *http.Response) bool {
+	return resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/login")
+}
+
+// loginRateLimitMarker is a stable, ASCII-only fragment of the Slovenian
+// "too many login attempts" message shown on the login page when the account is
+// temporarily blocked from logging in.
+const loginRateLimitMarker = "poskusov prijave"
+
+// isLoginRateLimited reports whether a login page body indicates that the account
+// is currently rate limited from logging in.
+func isLoginRateLimited(body string) bool {
+	return strings.Contains(body, loginRateLimitMarker)
+}
+
+// doWithRetry behaves like retryTransport but additionally recovers from an
+// expired session: if a request is redirected to /login, it refreshes the session
+// once and replays the request once. The replay uses retryTransport (not another
+// re-auth), so this can never loop.
+func (p *Provider) doWithRetry(req *http.Request) (*http.Response, error) {
+	resp, err := p.retryTransport(req)
+	if err != nil {
+		return nil, err
+	}
+	if !redirectedToLogin(resp) {
+		return resp, nil
+	}
+
+	resp.Body.Close()
+	if err := p.refreshSession(req.Context()); err != nil {
+		return nil, fmt.Errorf("failed to refresh expired session: %w", err)
+	}
+	if req.GetBody != nil {
+		body, berr := req.GetBody()
+		if berr != nil {
+			return nil, berr
+		}
+		req.Body = body
+	}
+	// Single replay without further re-auth, so a persistently failing login
+	// surfaces as an error to the caller instead of looping.
+	return p.retryTransport(req)
+}
+
+// refreshSession forces a fresh login after a session has expired. It is
+// serialized so concurrent callers do not all log in at once, and it re-checks
+// validity first in case another goroutine already refreshed the session.
+func (p *Provider) refreshSession(ctx context.Context) error {
+	p.authMu.Lock()
+	defer p.authMu.Unlock()
+	if p.sessionValid(ctx) {
+		return nil
+	}
+	return p.login(ctx)
+}
+
 // isAuthenticated reports whether a Laravel session cookie is present.
 func (p *Provider) isAuthenticated() bool {
 	for _, cookie := range p.client.Jar.Cookies(urlBaseP) {
@@ -171,8 +279,24 @@ func (p *Provider) authenticate(ctx context.Context) error {
 		return nil
 	}
 
+	return p.login(ctx)
+}
+
+// login performs a fresh username/password login and persists the session. Its
+// requests use retryTransport (never doWithRetry), so login can never recurse
+// into session-refresh handling.
+func (p *Provider) login(ctx context.Context) error {
+	// Drop any existing (possibly stale or expired) session cookie so the login
+	// handshake starts from a clean slate; a leftover cookie can interfere with
+	// the session/CSRF binding.
+	p.clearSessionCookies()
+
 	// Step 1: GET /login to collect cookies and the CSRF token.
-	loginResp, err := p.client.Get(urlLogin)
+	loginReq, err := http.NewRequestWithContext(ctx, http.MethodGet, urlLogin, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build login page request: %w", err)
+	}
+	loginResp, err := p.retryTransport(loginReq)
 	if err != nil {
 		return fmt.Errorf("failed to fetch login page: %w", err)
 	}
@@ -201,14 +325,20 @@ func (p *Provider) authenticate(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Referer", urlLogin)
 
-	resp, err := p.client.Do(req)
+	resp, err := p.retryTransport(req)
 	if err != nil {
 		return fmt.Errorf("failed to perform login request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Laravel redirects back to /login on bad credentials; any other path means success.
+	// Laravel redirects back to /login on a failed login; any other path means
+	// success. A failure is either bad credentials or, after too many attempts,
+	// a temporary rate-limit block that we surface distinctly.
 	if strings.HasSuffix(resp.Request.URL.Path, "/login") {
+		body, _ := io.ReadAll(resp.Body)
+		if isLoginRateLimited(string(body)) {
+			return ErrLoginRateLimited
+		}
 		return fmt.Errorf("authentication failed")
 	}
 
@@ -232,7 +362,7 @@ func (p *Provider) fetchDomains(ctx context.Context) ([]domainEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to build services page request: %w", err)
 	}
-	resp, err := p.client.Do(req)
+	resp, err := p.doWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get services page: %w", err)
 	}
@@ -356,7 +486,7 @@ func (p *Provider) getPageSnapshots(ctx context.Context, zone string) (pageData,
 		return pageData{}, fmt.Errorf("failed to build records page request: %w", err)
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.doWithRetry(req)
 	if err != nil {
 		return pageData{}, fmt.Errorf("failed to get records page: %w", err)
 	}
@@ -416,7 +546,7 @@ func (p *Provider) livewireRequest(ctx context.Context, payload livewirePayload)
 	req.Header.Set("Origin", urlBase)
 	req.Header.Set("Referer", urlBase)
 
-	resp, err := p.client.Do(req)
+	resp, err := p.doWithRetry(req)
 	if err != nil {
 		return livewireResponse{}, fmt.Errorf("failed to perform livewire request: %w", err)
 	}
@@ -803,6 +933,71 @@ func (p *Provider) getRecordTTL(ttl time.Duration) (time.Duration, error) {
 func sameRecord(a, b libdns.Record) bool {
 	ra, rb := a.RR(), b.RR()
 	return ra.Name == rb.Name && ra.Type == rb.Type && ra.TTL == rb.TTL && ra.Data == rb.Data
+}
+
+// rrKey returns a key identifying a record's RRset, i.e. its (name, type) pair.
+func rrKey(r libdns.Record) string {
+	rr := r.RR()
+	return rr.Name + "\x00" + rr.Type
+}
+
+// recordMatches reports whether the zone record cur matches the input record for
+// the purposes of deletion. The name must match; the type, TTL, and value are
+// each compared only when set on the input (empty type, zero TTL, and empty
+// value act as wildcards).
+func recordMatches(input, cur libdns.Record) bool {
+	ri, rc := input.RR(), cur.RR()
+	if ri.Name != rc.Name {
+		return false
+	}
+	if ri.Type != "" && ri.Type != rc.Type {
+		return false
+	}
+	if ri.TTL != 0 && ri.TTL != rc.TTL {
+		return false
+	}
+	if ri.Data != "" && ri.Data != rc.Data {
+		return false
+	}
+	return true
+}
+
+// withRecordID returns a copy of r with its ProviderData set to id, preserving
+// the concrete record type so later conversions remain type-aware.
+func withRecordID(r libdns.Record, id string) libdns.Record {
+	switch v := r.(type) {
+	case libdns.Address:
+		v.ProviderData = id
+		return v
+	case libdns.CNAME:
+		v.ProviderData = id
+		return v
+	case libdns.MX:
+		v.ProviderData = id
+		return v
+	case libdns.NS:
+		v.ProviderData = id
+		return v
+	case libdns.TXT:
+		v.ProviderData = id
+		return v
+	case libdns.SRV:
+		v.ProviderData = id
+		return v
+	case libdns.CAA:
+		v.ProviderData = id
+		return v
+	case libdns.ServiceBinding:
+		v.ProviderData = id
+		return v
+	case ALIAS:
+		v.ProviderData = id
+		return v
+	case unknownRecord:
+		v.providerData = id
+		return v
+	}
+	return r
 }
 
 // recordID returns the Neoserv-assigned numeric ID stored in ProviderData, or "" if absent.

@@ -14,6 +14,12 @@ import (
 // sessionCookieName is the Laravel session cookie set by moj.neoserv.si.
 const sessionCookieName = "moj_session"
 
+// sessionCookieDomain is the domain the server scopes the session cookie to. It
+// is shared across neoserv.si and its subdomains, so injected cookies must use
+// the same scope or they end up as a separate host-only cookie alongside the
+// server's, leaving the server with an ambiguous pair.
+const sessionCookieDomain = "neoserv.si"
+
 // cachedSession is the on-disk representation of a persisted login session.
 type cachedSession struct {
 	Cookie string `json:"cookie"`
@@ -40,9 +46,26 @@ func (p *Provider) sessionCookieValue() string {
 	return ""
 }
 
-// setSessionCookie seeds the cookie jar with a moj_session value.
+// setSessionCookie seeds the cookie jar with a moj_session value, scoped to the
+// same domain the server uses so it replaces the server's cookie rather than
+// coexisting with it as a host-only duplicate.
 func (p *Provider) setSessionCookie(value string) {
-	p.client.Jar.SetCookies(urlBaseP, []*http.Cookie{{Name: sessionCookieName, Value: value}})
+	p.client.Jar.SetCookies(urlBaseP, []*http.Cookie{{
+		Name:   sessionCookieName,
+		Value:  value,
+		Domain: sessionCookieDomain,
+		Path:   "/",
+	}})
+}
+
+// clearSessionCookies removes any moj_session cookie from the jar, covering both
+// the server's domain-scoped cookie and any host-only one, so a login starts from
+// a clean slate.
+func (p *Provider) clearSessionCookies() {
+	p.client.Jar.SetCookies(urlBaseP, []*http.Cookie{
+		{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1},
+		{Name: sessionCookieName, Value: "", Path: "/", Domain: sessionCookieDomain, MaxAge: -1},
+	})
 }
 
 // loadCachedSession reads a persisted session cookie from disk, or "" if there
@@ -71,13 +94,15 @@ func (p *Provider) saveCachedSession() error {
 
 // sessionValid reports whether the current cookie jar holds a working session.
 // It makes a cheap request that Laravel redirects to /login when the session is
-// missing or expired, so it never touches the rate-limited login endpoint.
+// missing or expired, so it never touches the rate-limited login endpoint. It
+// uses retryTransport rather than doWithRetry so it cannot trigger (and recurse
+// into) session-refresh handling.
 func (p *Provider) sessionValid(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlServices, nil)
 	if err != nil {
 		return false
 	}
-	resp, err := p.client.Do(req)
+	resp, err := p.retryTransport(req)
 	if err != nil {
 		return false
 	}

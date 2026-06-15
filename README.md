@@ -50,6 +50,29 @@ All record types Neoserv supports are handled, including their type-specific fie
 type — an apex-capable, CNAME-like record. It satisfies `libdns.Record` and works
 with all of the provider's record methods just like the built-in types.
 
+## Behavior
+
+The provider follows the [libdns interface semantics](https://pkg.go.dev/github.com/libdns/libdns):
+
+- **AppendRecords** only creates records and never modifies existing ones. Because
+  Neoserv's API does not return the ID of a created record, new records are
+  identified by diffing the zone before and after the call. Any `ProviderData` on
+  the input is ignored.
+- **SetRecords** replaces RRsets: for each `(name, type)` pair in the input, the
+  only records of that pair left in the zone are the ones provided. Matching
+  records are kept, others are updated in place (preserving their ID) or created,
+  and surplus records of that pair are deleted. Records of other `(name, type)`
+  pairs are untouched. It is not atomic.
+- **DeleteRecords** matches by content — the name must match, while type, TTL, and
+  value are matched only when non-empty (so they act as wildcards when omitted).
+  A `ProviderData` ID, when present, targets exactly that record. Records that do
+  not exist are silently ignored.
+
+All record methods are safe for concurrent use (serialized per zone), and transient
+network errors and `429`/`5xx` responses are retried with backoff. Record types
+that Neoserv exposes but libdns does not model (e.g. `WR` redirects) are returned as
+an internal record type that still round-trips through delete.
+
 ## Session Caching
 
 Neoserv rate-limits the login endpoint, which is easy to hit while developing or
@@ -69,6 +92,19 @@ provider := neoserv.Provider{
 	DisableSessionCache: true,                     // opt out of on-disk caching
 }
 ```
+
+If too many logins are attempted, Neoserv temporarily blocks logging in for the
+account (about an hour). When a method needs to log in during that window it
+returns `neoserv.ErrLoginRateLimited`, which callers can detect and back off from:
+
+```go
+if errors.Is(err, neoserv.ErrLoginRateLimited) {
+	// blocked from logging in; retry later
+}
+```
+
+A still-valid cached session keeps working during the block, since it does not
+require logging in.
 
 ## Supported TTL Values
 

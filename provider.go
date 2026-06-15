@@ -4,13 +4,22 @@ package neoserv
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/libdns/libdns"
 )
+
+// ErrLoginRateLimited is returned when Neoserv has temporarily blocked login
+// attempts for the account because there were too many tries. The block clears
+// after a while (about an hour); callers can detect it with errors.Is and back
+// off rather than retrying. A still-valid cached session is unaffected, since it
+// does not require logging in.
+var ErrLoginRateLimited = errors.New("login rate limited: too many login attempts, try again later")
 
 // Provider facilitates DNS record manipulation with Neoserv.si.
 type Provider struct {
@@ -40,8 +49,33 @@ type Provider struct {
 	// This is used to avoid making unnecessary API calls to get the zone ID.
 	zoneIdCache map[string]string
 
-	// mutex is used to synchronize access to the provider.
+	// mutex guards the client, the zone ID cache, and the zoneLocks map.
 	mutex sync.Mutex
+	// authMu serializes re-authentication when an in-flight request finds the
+	// session expired, so concurrent callers do not all log in at once.
+	authMu sync.Mutex
+	// zoneLocks holds a per-zone mutex used to serialize the read-modify-write
+	// sequences in the mutating record methods, so concurrent callers do not
+	// corrupt each other's view of the zone.
+	zoneLocks map[string]*sync.Mutex
+}
+
+// zoneLock returns the mutex dedicated to the given zone, creating it on first
+// use. Different zones get independent locks so unrelated zones are not
+// serialized against each other.
+func (p *Provider) zoneLock(zone string) *sync.Mutex {
+	key := strings.TrimSuffix(zone, ".")
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if p.zoneLocks == nil {
+		p.zoneLocks = make(map[string]*sync.Mutex)
+	}
+	lk := p.zoneLocks[key]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		p.zoneLocks[key] = lk
+	}
+	return lk
 }
 
 // Neoserv API does not support all TTL values. The following are the supported TTL values.
@@ -100,11 +134,19 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
+// Any ProviderData (record ID) on the input is ignored; appended records are
+// always created anew.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	lock := p.zoneLock(zone)
+	lock.Lock()
+	defer lock.Unlock()
+	return p.appendRecords(ctx, zone, records)
+}
+
+// appendRecords is the unlocked implementation of AppendRecords. Callers must
+// hold the zone lock.
+func (p *Provider) appendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	for _, record := range records {
-		if recordID(record) != "" {
-			return nil, fmt.Errorf("failed to append records: record ID must be empty")
-		}
 		if _, err := p.getRecordTTL(record.RR().TTL); err != nil {
 			return nil, fmt.Errorf("failed to append records: %w", err)
 		}
@@ -162,81 +204,170 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	return appendedRecords, nil
 }
 
-// SetRecords sets the records in the zone, either by updating existing records or creating new ones.
-// It returns the updated records.
+// SetRecords sets the records in the zone so that, for every (name, type) pair
+// present in the input, the only records of that pair in the zone are the ones
+// provided. Records of other (name, type) pairs are left untouched. It returns
+// the records that were set, in input order.
+//
+// Existing records that match an input record exactly are kept as-is; remaining
+// existing records in an affected RRset are reused via an in-place update where
+// possible (preserving their ID), and otherwise created or deleted to reach the
+// desired state. SetRecords is not atomic: a mid-operation error may leave the
+// zone partially modified.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	lock := p.zoneLock(zone)
+	lock.Lock()
+	defer lock.Unlock()
+
 	for _, record := range records {
 		if _, err := p.getRecordTTL(record.RR().TTL); err != nil {
 			return nil, fmt.Errorf("failed to set records: %w", err)
 		}
 	}
 
-	currentRecords, err := p.getRecords(ctx, zone)
+	current, err := p.getRecords(ctx, zone)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set records: %w", err)
 	}
-	currentRecordsSet := make(map[string]libdns.Record, len(currentRecords))
-	for _, record := range currentRecords {
-		currentRecordsSet[recordID(record)] = record
+	currentByKey := make(map[string][]libdns.Record)
+	for _, r := range current {
+		currentByKey[rrKey(r)] = append(currentByKey[rrKey(r)], r)
 	}
 
-	toAdd := make([]libdns.Record, 0, len(records))
-	toAddIdx := make([]int, 0, len(records))
-	toEditIdx := make([]int, 0, len(records))
+	// Group the input by RRset, remembering each record's original index so the
+	// output can be returned in input order.
+	type item struct {
+		idx int
+		rec libdns.Record
+	}
+	inputByKey := make(map[string][]item)
+	keyOrder := make([]string, 0)
+	for i, r := range records {
+		k := rrKey(r)
+		if _, seen := inputByKey[k]; !seen {
+			keyOrder = append(keyOrder, k)
+		}
+		inputByKey[k] = append(inputByKey[k], item{idx: i, rec: r})
+	}
 
-	setRecords := make([]libdns.Record, len(records))
-	for i, record := range records {
-		if recordID(record) == "" {
-			toAdd = append(toAdd, record)
-			toAddIdx = append(toAddIdx, i)
-		} else {
-			currentRecord, ok := currentRecordsSet[recordID(record)]
-			if !ok {
-				return nil, fmt.Errorf("failed to set records: record %s not found", record.RR().Name)
+	out := make([]libdns.Record, len(records))
+	toAppend := make([]item, 0)
+	toDelete := make([]libdns.Record, 0)
+
+	for _, k := range keyOrder {
+		items := inputByKey[k]
+		existing := currentByKey[k]
+		usedExisting := make([]bool, len(existing))
+		matched := make([]bool, len(items))
+
+		// Pass 1: keep exact content matches as-is (they already have an ID).
+		for i, it := range items {
+			for j, e := range existing {
+				if !usedExisting[j] && sameRecord(it.rec, e) {
+					usedExisting[j] = true
+					matched[i] = true
+					out[it.idx] = e
+					break
+				}
 			}
-			if sameRecord(record, currentRecord) {
-				setRecords[i] = record
+		}
+
+		// Pass 2: reconcile the leftovers. Reuse leftover existing records by
+		// updating them in place; append when there are more desired than
+		// existing; delete when there are more existing than desired.
+		leftoverExisting := make([]int, 0)
+		for j := range existing {
+			if !usedExisting[j] {
+				leftoverExisting = append(leftoverExisting, j)
+			}
+		}
+		next := 0
+		for i, it := range items {
+			if matched[i] {
+				continue
+			}
+			if next < len(leftoverExisting) {
+				e := existing[leftoverExisting[next]]
+				next++
+				updated := withRecordID(it.rec, recordID(e))
+				if err := p.updateRecord(ctx, zone, updated); err != nil {
+					return nil, fmt.Errorf("failed to set records: %w", err)
+				}
+				out[it.idx] = updated
 			} else {
-				toEditIdx = append(toEditIdx, i)
+				toAppend = append(toAppend, it)
 			}
+		}
+		for ; next < len(leftoverExisting); next++ {
+			toDelete = append(toDelete, existing[leftoverExisting[next]])
 		}
 	}
 
-	added, err := p.AppendRecords(ctx, zone, toAdd)
-	if err != nil {
-		return nil, fmt.Errorf("failed to set records: %w", err)
-	}
-	if len(added) != len(toAdd) {
-		return nil, fmt.Errorf("failed to set records: expected %d records to be added, got %d", len(toAdd), len(added))
-	}
-	for i, idx := range toAddIdx {
-		setRecords[idx] = added[i]
-	}
-
-	for _, idx := range toEditIdx {
-		if err := p.updateRecord(ctx, zone, records[idx]); err != nil {
+	if len(toAppend) > 0 {
+		recs := make([]libdns.Record, len(toAppend))
+		for i, it := range toAppend {
+			recs[i] = it.rec
+		}
+		added, err := p.appendRecords(ctx, zone, recs)
+		if err != nil {
 			return nil, fmt.Errorf("failed to set records: %w", err)
 		}
-		setRecords[idx] = records[idx]
+		for i, it := range toAppend {
+			out[it.idx] = added[i]
+		}
 	}
 
-	return setRecords, nil
+	for _, r := range toDelete {
+		if err := p.deleteRecord(ctx, zone, r); err != nil {
+			return nil, fmt.Errorf("failed to set records: %w", err)
+		}
+	}
+
+	return out, nil
 }
 
-// DeleteRecords deletes the records from the zone. It returns the records that were deleted.
+// DeleteRecords deletes records from the zone that match the input and returns
+// the records that were actually deleted. Input records that do not exist in the
+// zone are silently ignored.
+//
+// Matching is by content: the Name must match, and the Type, TTL, and Value are
+// each matched only when non-empty (an empty Type, zero TTL, or empty Value acts
+// as a wildcard for that field). When an input record carries ProviderData (a
+// record ID), that ID is used to target exactly one record instead.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	for _, record := range records {
-		if recordID(record) == "" {
-			return nil, fmt.Errorf("failed to delete records: record ID is required")
-		}
+	lock := p.zoneLock(zone)
+	lock.Lock()
+	defer lock.Unlock()
+
+	current, err := p.getRecords(ctx, zone)
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete records: %w", err)
 	}
 
+	deletedIDs := make(map[string]struct{})
 	removed := make([]libdns.Record, 0, len(records))
-	for _, record := range records {
-		if err := p.deleteRecord(ctx, zone, record); err != nil {
-			return removed, fmt.Errorf("failed to delete records: %w", err)
+	for _, input := range records {
+		id := recordID(input)
+		for _, cur := range current {
+			curID := recordID(cur)
+			if _, done := deletedIDs[curID]; done {
+				continue
+			}
+			var match bool
+			if id != "" {
+				match = curID == id
+			} else {
+				match = recordMatches(input, cur)
+			}
+			if !match {
+				continue
+			}
+			if err := p.deleteRecord(ctx, zone, cur); err != nil {
+				return removed, fmt.Errorf("failed to delete records: %w", err)
+			}
+			deletedIDs[curID] = struct{}{}
+			removed = append(removed, cur)
 		}
-		removed = append(removed, record)
 	}
 
 	return removed, nil
