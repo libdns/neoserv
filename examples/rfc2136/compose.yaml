@@ -4,15 +4,12 @@ services:
       context: ../..
       dockerfile: examples/rfc2136/Dockerfile
     ports:
-      # HOST_PORT defaults to 5353; override in .env to avoid conflicts (e.g. HOST_PORT=5354).
-      # Change 127.0.0.1 to 0.0.0.0 to expose on all interfaces.
-      - "${HOST_ADDR:-127.0.0.1}:${HOST_PORT:-5353}:5353/udp"
-      - "${HOST_ADDR:-127.0.0.1}:${HOST_PORT:-5353}:5353/tcp"
+      - "${HOST_PORT:-5353}:5353/udp"
+      - "${HOST_PORT:-5353}:5353/tcp"
     environment:
       NEOSERV_USERNAME: ${NEOSERV_USERNAME}       # Neoserv account email
       NEOSERV_PASSWORD: ${NEOSERV_PASSWORD}       # Neoserv account password
       NEOSERV_ZONE: ${NEOSERV_ZONE:-}             # optional: restrict updates to one zone
       RFC2136_TSIG_KEY: ${RFC2136_TSIG_KEY:-}     # optional: TSIG key name; default "acme."
       RFC2136_TSIG_SECRET: ${RFC2136_TSIG_SECRET} # base64-encoded TSIG shared secret
-      # RFC2136_TSIG_ALG: hmac-sha256.            # TSIG algorithm; default hmac-sha256.
     restart: unless-stopped

@@ -21,6 +21,65 @@ Run it with:
 NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password NEOSERV_ZONE=your.domain go run ./examples/neoserv.go
 ```
 
+## RFC 2136 Proxy
+
+The [`examples/rfc2136`](./examples/rfc2136) directory contains a small DNS server that accepts TSIG-authenticated [RFC 2136](https://www.rfc-editor.org/rfc/rfc2136) `UPDATE` messages and applies them to Neoserv through this provider. It lets off-the-shelf tooling that speaks RFC 2136 — `certbot --dns-rfc2136`, cert-manager, `acme.sh`, lego, `nsupdate`, external-dns — manage Neoserv records without writing any Go. It is an example/demo, not a hardened server (prerequisites are not enforced and updates are not atomic).
+
+### Configuration
+
+| Variable              | Default                           | Description                                  |
+| --------------------- | --------------------------------- | -------------------------------------------- |
+| `NEOSERV_USERNAME`    | —                                 | Neoserv account email (required)             |
+| `NEOSERV_PASSWORD`    | —                                 | Neoserv account password (required)          |
+| `NEOSERV_ZONE`        | —                                 | optional; if set, only this zone is accepted |
+| `RFC2136_TSIG_SECRET` | —                                 | base64-encoded TSIG shared secret (required) |
+| `RFC2136_TSIG_KEY`    | `acme.`                           | TSIG key name                                |
+| `RFC2136_LISTEN`      | `0.0.0.0:5353`                    | listen address (served on UDP and TCP)       |
+| `RFC2136_UPSTREAM`    | first entry in `/etc/resolv.conf` | upstream resolver for propagation checks     |
+
+### Docker
+
+Create a `.env` file in `examples/rfc2136/`:
+
+```env
+NEOSERV_USERNAME=your@email.com
+NEOSERV_PASSWORD=your_password
+RFC2136_TSIG_SECRET=<base64-encoded secret>
+# NEOSERV_ZONE=your.domain      # optional: restrict to one zone
+# RFC2136_TSIG_KEY=acme.        # optional: default is acme.
+# HOST_PORT=5353                 # optional: host port to bind
+```
+
+Then start the proxy:
+
+```bash
+cd examples/rfc2136
+docker compose up -d
+```
+
+The proxy listens on `HOST_PORT` (default `5353`) on the host.
+
+### Running directly
+
+```bash
+cd examples/rfc2136
+RFC2136_TSIG_SECRET=$(head -c32 /dev/urandom | base64) \
+NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password \
+go run .
+```
+
+### Client example
+
+Drive it with any RFC 2136 client, for example `nsupdate`:
+
+```
+server 127.0.0.1 5353
+key hmac-sha256:acme. <same-base64-secret>
+zone your.domain.
+update add _acme-challenge.your.domain. 60 TXT "token"
+send
+```
+
 ## Implemented Interfaces
 
 The provider implements the following `libdns` interfaces:
@@ -118,46 +177,4 @@ provider := neoserv.Provider{
 	Password:              "your-neoserv-password",
 	UnsupportedTTLisError: true,
 }
-```
-
-### RFC 2136 proxy
-
-The [`examples/rfc2136`](./examples/rfc2136) directory contains a small DNS server
-that accepts TSIG-authenticated [RFC 2136](https://www.rfc-editor.org/rfc/rfc2136)
-`UPDATE` messages and applies them to Neoserv through this provider. It lets
-off-the-shelf tooling that speaks RFC 2136 — `certbot --dns-rfc2136`,
-cert-manager, `acme.sh`, `nsupdate`, external-dns — manage Neoserv records
-without writing any Go. It is an example/demo, not a hardened server
-(prerequisites are not enforced and updates are not atomic).
-
-It is its own Go module (so `miekg/dns` does not become a dependency of the
-provider), configured via environment variables:
-
-| Variable              | Default            | Description                                |
-| --------------------- | ------------------ | ------------------------------------------ |
-| `NEOSERV_USERNAME`    | —                  | Neoserv account email (required)           |
-| `NEOSERV_PASSWORD`    | —                  | Neoserv account password (required)        |
-| `NEOSERV_ZONE`        | —                  | optional; if set, only this zone is accepted |
-| `RFC2136_TSIG_SECRET` | —                  | base64-encoded TSIG shared secret (required) |
-| `RFC2136_TSIG_KEY`    | `acme.`            | TSIG key name                              |
-| `RFC2136_TSIG_ALG`    | `hmac-sha256.`     | TSIG algorithm                             |
-| `RFC2136_LISTEN`      | `0.0.0.0:5353`     | listen address (served on UDP and TCP)     |
-
-Run it:
-
-```bash
-cd examples/rfc2136
-RFC2136_TSIG_SECRET=$(head -c32 /dev/urandom | base64) \
-NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password \
-go run .
-```
-
-Then drive it with any RFC 2136 client, for example `nsupdate`:
-
-```
-server 127.0.0.1 5353
-key hmac-sha256:acme. <same-base64-secret>
-zone your.domain.
-update add _acme-challenge.your.domain. 60 TXT "token"
-send
 ```

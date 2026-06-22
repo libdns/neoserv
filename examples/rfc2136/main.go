@@ -15,7 +15,6 @@
 //	NEOSERV_ZONE         optional: if set, only this zone is accepted
 //	RFC2136_TSIG_SECRET  base64-encoded TSIG shared secret (required)
 //	RFC2136_TSIG_KEY     TSIG key name, default "acme."
-//	RFC2136_TSIG_ALG     TSIG algorithm, default "hmac-sha256."
 //	RFC2136_LISTEN       listen address, default "0.0.0.0:5353"
 //	RFC2136_UPSTREAM     upstream resolver for non-UPDATE queries, default: first entry in /etc/resolv.conf
 package main
@@ -40,7 +39,6 @@ import (
 type proxy struct {
 	provider    *neoserv.Provider
 	tsigKeyName string
-	tsigAlg     string
 	// allowZone, when non-empty, is the only zone (FQDN, lower-case) the proxy
 	// will accept updates for. Empty means accept any zone the account owns.
 	allowZone string
@@ -61,10 +59,6 @@ func main() {
 		log.Fatal("set NEOSERV_USERNAME, NEOSERV_PASSWORD and RFC2136_TSIG_SECRET")
 	}
 
-	alg := os.Getenv("RFC2136_TSIG_ALG")
-	if alg == "" {
-		alg = "hmac-sha256."
-	}
 	listen := os.Getenv("RFC2136_LISTEN")
 	if listen == "" {
 		listen = "0.0.0.0:5353"
@@ -81,7 +75,6 @@ func main() {
 	p := &proxy{
 		provider:    &neoserv.Provider{Username: username, Password: password},
 		tsigKeyName: keyName,
-		tsigAlg:     dns.Fqdn(alg),
 		allowZone:   strings.ToLower(dns.Fqdn(os.Getenv("NEOSERV_ZONE"))),
 		upstream:    upstream,
 	}
@@ -136,10 +129,9 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 
 	reply := func(rcode int) {
 		m.SetRcode(r, rcode)
-		// Sign the reply with the same key so the client accepts it. Only
-		// possible when the request itself carried a (valid) TSIG.
-		if r.IsTsig() != nil && w.TsigStatus() == nil {
-			m.SetTsig(p.tsigKeyName, p.tsigAlg, 300, time.Now().Unix())
+		// Mirror the request's TSIG algorithm in the reply (RFC 2845).
+		if tsig := r.IsTsig(); tsig != nil && w.TsigStatus() == nil {
+			m.SetTsig(p.tsigKeyName, tsig.Algorithm, 300, time.Now().Unix())
 		}
 		_ = w.WriteMsg(m)
 	}
@@ -149,7 +141,7 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 			p.forwardQuery(w, r)
 			return
 		}
-		log.Printf("non-update opcode %d from %s — refusing", r.Opcode, w.RemoteAddr())
+		log.Printf("non-update opcode %s from %s — refusing", dns.OpcodeToString[r.Opcode], w.RemoteAddr())
 		reply(dns.RcodeRefused)
 		return
 	}
