@@ -132,13 +132,18 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	if r.Opcode != dns.OpcodeUpdate {
+		log.Printf("non-update opcode %d from %s — refusing", r.Opcode, w.RemoteAddr())
 		reply(dns.RcodeRefused)
 		return
 	}
 
 	// Require a valid TSIG on every update.
-	if r.IsTsig() == nil || w.TsigStatus() != nil {
-		log.Printf("rejected update: missing or invalid TSIG (status: %v)", w.TsigStatus())
+	if tsig := r.IsTsig(); tsig == nil || w.TsigStatus() != nil {
+		keyAttempted := ""
+		if tsig != nil {
+			keyAttempted = tsig.Hdr.Name
+		}
+		log.Printf("rejected update from %s: missing or invalid TSIG (key=%q status: %v)", w.RemoteAddr(), keyAttempted, w.TsigStatus())
 		reply(dns.RcodeNotAuth)
 		return
 	}
@@ -149,10 +154,12 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 	}
 	zone := r.Question[0].Name
 	if p.allowZone != "" && !strings.EqualFold(zone, p.allowZone) {
-		log.Printf("rejected update for zone %q: not in allowlist", zone)
+		log.Printf("rejected update from %s: zone %q not in allowlist", w.RemoteAddr(), zone)
 		reply(dns.RcodeNotZone)
 		return
 	}
+
+	log.Printf("update from %s: zone=%q key=%q records=%d", w.RemoteAddr(), zone, r.IsTsig().Hdr.Name, len(r.Ns))
 
 	// Prerequisites (r.Answer) are not enforced by this example.
 
@@ -163,13 +170,16 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 		switch hdr.Class {
 		case dns.ClassNONE:
 			// Delete an individual RR from an RRset (rdata is significant).
+			log.Printf("  - %s %s (exact RR)", hdr.Name, dns.TypeToString[hdr.Rrtype])
 			deletes = append(deletes, toRecord(rr, name, 0))
 		case dns.ClassANY:
 			if hdr.Rrtype == dns.TypeANY {
 				// Delete all RRsets at the name.
+				log.Printf("  - %s ANY (all records at name)", hdr.Name)
 				deletes = append(deletes, libdns.RR{Name: name})
 			} else {
 				// Delete an entire RRset (a type at a name).
+				log.Printf("  - %s %s (entire RRset)", hdr.Name, dns.TypeToString[hdr.Rrtype])
 				deletes = append(deletes, libdns.RR{
 					Type: dns.TypeToString[hdr.Rrtype],
 					Name: name,
@@ -177,6 +187,7 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 			}
 		default:
 			// Add to an RRset.
+			log.Printf("  + %s %s TTL=%ds", hdr.Name, dns.TypeToString[hdr.Rrtype], hdr.Ttl)
 			adds = append(adds, toRecord(rr, name, time.Duration(hdr.Ttl)*time.Second))
 		}
 	}
@@ -187,18 +198,22 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 	// Process deletes before adds. The provider serializes per-zone
 	// read-modify-write internally, so concurrent updates are safe.
 	if len(deletes) > 0 {
+		log.Printf("deleting %d record(s) in %q", len(deletes), zone)
 		if _, err := p.provider.DeleteRecords(ctx, zone, deletes); err != nil {
 			log.Printf("DeleteRecords for %q failed: %v", zone, err)
 			reply(dns.RcodeServerFailure)
 			return
 		}
+		log.Printf("deleted %d record(s) in %q", len(deletes), zone)
 	}
 	if len(adds) > 0 {
+		log.Printf("adding %d record(s) to %q", len(adds), zone)
 		if _, err := p.provider.AppendRecords(ctx, zone, adds); err != nil {
 			log.Printf("AppendRecords for %q failed: %v", zone, err)
 			reply(dns.RcodeServerFailure)
 			return
 		}
+		log.Printf("added %d record(s) to %q", len(adds), zone)
 	}
 
 	log.Printf("update for %q ok: %d add(s), %d delete(s)", zone, len(adds), len(deletes))
