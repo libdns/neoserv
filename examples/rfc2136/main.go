@@ -17,11 +17,13 @@
 //	RFC2136_TSIG_KEY     TSIG key name, default "acme."
 //	RFC2136_TSIG_ALG     TSIG algorithm, default "hmac-sha256."
 //	RFC2136_LISTEN       listen address, default "0.0.0.0:5353"
+//	RFC2136_UPSTREAM     upstream resolver for non-UPDATE queries, default: first entry in /etc/resolv.conf
 package main
 
 import (
 	"context"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -42,6 +44,8 @@ type proxy struct {
 	// allowZone, when non-empty, is the only zone (FQDN, lower-case) the proxy
 	// will accept updates for. Empty means accept any zone the account owns.
 	allowZone string
+	// upstream is the resolver address (host:port) used to forward QUERY opcodes.
+	upstream string
 }
 
 func main() {
@@ -65,12 +69,21 @@ func main() {
 	if listen == "" {
 		listen = "0.0.0.0:5353"
 	}
+	upstream := os.Getenv("RFC2136_UPSTREAM")
+	if upstream == "" {
+		cc, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		if err != nil || len(cc.Servers) == 0 {
+			log.Fatal("no upstream resolver: set RFC2136_UPSTREAM or ensure /etc/resolv.conf is present")
+		}
+		upstream = net.JoinHostPort(cc.Servers[0], cc.Port)
+	}
 
 	p := &proxy{
 		provider:    &neoserv.Provider{Username: username, Password: password},
 		tsigKeyName: keyName,
 		tsigAlg:     dns.Fqdn(alg),
 		allowZone:   strings.ToLower(dns.Fqdn(os.Getenv("NEOSERV_ZONE"))),
+		upstream:    upstream,
 	}
 	if p.allowZone == "." {
 		p.allowZone = ""
@@ -90,7 +103,7 @@ func main() {
 			}
 		}()
 	}
-	log.Printf("RFC 2136 proxy listening on %s (udp+tcp), TSIG key %q", listen, keyName)
+	log.Printf("RFC 2136 proxy listening on %s (udp+tcp), TSIG key %q, upstream %s", listen, keyName, upstream)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -132,6 +145,10 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	if r.Opcode != dns.OpcodeUpdate {
+		if r.Opcode == dns.OpcodeQuery {
+			p.forwardQuery(w, r)
+			return
+		}
 		log.Printf("non-update opcode %d from %s — refusing", r.Opcode, w.RemoteAddr())
 		reply(dns.RcodeRefused)
 		return
@@ -170,16 +187,16 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 		switch hdr.Class {
 		case dns.ClassNONE:
 			// Delete an individual RR from an RRset (rdata is significant).
-			log.Printf("  - %s %s (exact RR)", hdr.Name, dns.TypeToString[hdr.Rrtype])
+			log.Printf("  - %s %s", hdr.Name, dns.TypeToString[hdr.Rrtype])
 			deletes = append(deletes, toRecord(rr, name, 0))
 		case dns.ClassANY:
 			if hdr.Rrtype == dns.TypeANY {
 				// Delete all RRsets at the name.
-				log.Printf("  - %s ANY (all records at name)", hdr.Name)
+				log.Printf("  - %s ANY", hdr.Name)
 				deletes = append(deletes, libdns.RR{Name: name})
 			} else {
 				// Delete an entire RRset (a type at a name).
-				log.Printf("  - %s %s (entire RRset)", hdr.Name, dns.TypeToString[hdr.Rrtype])
+				log.Printf("  - %s %s", hdr.Name, dns.TypeToString[hdr.Rrtype])
 				deletes = append(deletes, libdns.RR{
 					Type: dns.TypeToString[hdr.Rrtype],
 					Name: name,
@@ -198,26 +215,36 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 	// Process deletes before adds. The provider serializes per-zone
 	// read-modify-write internally, so concurrent updates are safe.
 	if len(deletes) > 0 {
-		log.Printf("deleting %d record(s) in %q", len(deletes), zone)
 		if _, err := p.provider.DeleteRecords(ctx, zone, deletes); err != nil {
 			log.Printf("DeleteRecords for %q failed: %v", zone, err)
 			reply(dns.RcodeServerFailure)
 			return
 		}
-		log.Printf("deleted %d record(s) in %q", len(deletes), zone)
 	}
 	if len(adds) > 0 {
-		log.Printf("adding %d record(s) to %q", len(adds), zone)
 		if _, err := p.provider.AppendRecords(ctx, zone, adds); err != nil {
 			log.Printf("AppendRecords for %q failed: %v", zone, err)
 			reply(dns.RcodeServerFailure)
 			return
 		}
-		log.Printf("added %d record(s) to %q", len(adds), zone)
 	}
 
 	log.Printf("update for %q ok: %d add(s), %d delete(s)", zone, len(adds), len(deletes))
 	reply(dns.RcodeSuccess)
+}
+
+// forwardQuery proxies a DNS QUERY opcode to the upstream resolver. This lets
+// clients like lego verify record propagation through the same server address.
+func (p *proxy) forwardQuery(w dns.ResponseWriter, r *dns.Msg) {
+	resp, _, err := new(dns.Client).Exchange(r, p.upstream)
+	if err != nil {
+		log.Printf("forward query to %s failed: %v", p.upstream, err)
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeServerFailure)
+		_ = w.WriteMsg(m)
+		return
+	}
+	_ = w.WriteMsg(resp)
 }
 
 // toRecord converts a miekg RR to a libdns.Record with the given relative name
