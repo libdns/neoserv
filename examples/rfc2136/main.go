@@ -44,6 +44,14 @@ type proxy struct {
 	allowZone string
 	// upstream is the resolver address (host:port) used to forward QUERY opcodes.
 	upstream string
+	// updates feeds applyUpdates, which applies accepted updates in arrival order.
+	updates chan update
+}
+
+// update is one authenticated UPDATE message waiting to be applied.
+type update struct {
+	zone          string
+	adds, deletes []libdns.Record
 }
 
 func main() {
@@ -77,10 +85,13 @@ func main() {
 		tsigKeyName: keyName,
 		allowZone:   strings.ToLower(dns.Fqdn(os.Getenv("NEOSERV_ZONE"))),
 		upstream:    upstream,
+		updates:     make(chan update, 64),
 	}
 	if p.allowZone == "." {
 		p.allowZone = ""
 	}
+
+	go p.applyUpdates()
 
 	dns.HandleFunc(".", p.handleUpdate)
 	tsig := map[string]string{keyName: secret}
@@ -201,28 +212,46 @@ func (p *proxy) handleUpdate(w dns.ResponseWriter, r *dns.Msg) {
 		}
 	}
 
+	// Neoserv is driven through its web UI and an edit takes longer than the 5s
+	// some RFC 2136 clients wait, so acknowledge now and apply afterwards. Failures
+	// are only logged; clients that care verify propagation through DNS.
+	select {
+	case p.updates <- update{zone: zone, adds: adds, deletes: deletes}:
+		reply(dns.RcodeSuccess)
+	default:
+		log.Printf("update queue full, refusing update for %q", zone)
+		reply(dns.RcodeServerFailure)
+	}
+}
+
+// applyUpdates applies queued updates one at a time, so a delete followed by an
+// add from the same client cannot be reordered.
+func (p *proxy) applyUpdates() {
+	for u := range p.updates {
+		p.apply(u)
+	}
+}
+
+func (p *proxy) apply(u update) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// Process deletes before adds. The provider serializes per-zone
 	// read-modify-write internally, so concurrent updates are safe.
-	if len(deletes) > 0 {
-		if _, err := p.provider.DeleteRecords(ctx, zone, deletes); err != nil {
-			log.Printf("DeleteRecords for %q failed: %v", zone, err)
-			reply(dns.RcodeServerFailure)
+	if len(u.deletes) > 0 {
+		if _, err := p.provider.DeleteRecords(ctx, u.zone, u.deletes); err != nil {
+			log.Printf("DeleteRecords for %q failed: %v", u.zone, err)
 			return
 		}
 	}
-	if len(adds) > 0 {
-		if _, err := p.provider.AppendRecords(ctx, zone, adds); err != nil {
-			log.Printf("AppendRecords for %q failed: %v", zone, err)
-			reply(dns.RcodeServerFailure)
+	if len(u.adds) > 0 {
+		if _, err := p.provider.AppendRecords(ctx, u.zone, u.adds); err != nil {
+			log.Printf("AppendRecords for %q failed: %v", u.zone, err)
 			return
 		}
 	}
 
-	log.Printf("update for %q ok: %d add(s), %d delete(s)", zone, len(adds), len(deletes))
-	reply(dns.RcodeSuccess)
+	log.Printf("update for %q ok: %d add(s), %d delete(s)", u.zone, len(u.adds), len(u.deletes))
 }
 
 // forwardQuery proxies a DNS QUERY opcode to the upstream resolver. This lets
