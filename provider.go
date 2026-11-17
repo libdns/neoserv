@@ -27,6 +27,9 @@ type Provider struct {
 	Username string `json:"username,omitempty"`
 	// Password used to authenticate with moj.neoserv.si
 	Password string `json:"password,omitempty"`
+	// TOTPSecret is the base32 key shown when enabling two-factor login in
+	// moj.neoserv.si ("Ključ, za ročno nameščanje"). Two-factor login is required.
+	TOTPSecret string `json:"totp_secret,omitempty"`
 
 	// UnsupportedTTLisError determines whether an unsupported TTL value should be treated as an error.
 	// If set to true, the provider will return an error if an unsupported TTL value is requested.

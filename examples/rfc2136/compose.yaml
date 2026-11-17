@@ -9,6 +9,7 @@ services:
     environment:
       NEOSERV_USERNAME: ${NEOSERV_USERNAME}       # Neoserv account email
       NEOSERV_PASSWORD: ${NEOSERV_PASSWORD}       # Neoserv account password
+      NEOSERV_TOTP: ${NEOSERV_TOTP}               # Neoserv 2FA key
       NEOSERV_ZONE: ${NEOSERV_ZONE:-}             # optional: restrict updates to one zone
       RFC2136_TSIG_KEY: ${RFC2136_TSIG_KEY:-}     # optional: TSIG key name; default "acme."
       RFC2136_TSIG_SECRET: ${RFC2136_TSIG_SECRET} # base64-encoded TSIG shared secret

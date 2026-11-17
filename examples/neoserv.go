@@ -14,20 +14,23 @@ import (
 // It requires the following environment variables to be set:
 // - NEOSERV_USERNAME: the username for the Neoserv API
 // - NEOSERV_PASSWORD: the password for the Neoserv API
+// - NEOSERV_TOTP: the two-factor login key
 // - NEOSERV_ZONE: the zone to manage
 // The example will list the existing records, add a new TXT record, and list the added record.
 func main() {
 	username := os.Getenv("NEOSERV_USERNAME")
 	password := os.Getenv("NEOSERV_PASSWORD")
+	totp := os.Getenv("NEOSERV_TOTP")
 	zone := os.Getenv("NEOSERV_ZONE")
-	if username == "" || password == "" || zone == "" {
-		fmt.Println("Please set the NEOSERV_USERNAME, NEOSERV_PASSWORD and NEOSERV_ZONE environment variables.")
+	if username == "" || password == "" || totp == "" || zone == "" {
+		fmt.Println("Please set the NEOSERV_USERNAME, NEOSERV_PASSWORD, NEOSERV_TOTP and NEOSERV_ZONE environment variables.")
 		os.Exit(1)
 	}
 
 	provider := neoserv.Provider{
-		Username: username,
-		Password: password,
+		Username:   username,
+		Password:   password,
+		TOTPSecret: totp,
 	}
 
 	// Get existing records

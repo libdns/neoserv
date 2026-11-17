@@ -17,6 +17,7 @@ import (
 var (
 	username = ""
 	password = ""
+	totpKey  = ""
 	zone     = ""
 )
 
@@ -32,18 +33,29 @@ func init() {
 	}
 	username = os.Getenv("NEOSERV_USERNAME")
 	password = os.Getenv("NEOSERV_PASSWORD")
+	totpKey = os.Getenv("NEOSERV_TOTP")
 	zone = os.Getenv("NEOSERV_ZONE")
 
-	if username == "" || password == "" || zone == "" {
-		panic("missing required environment variables NEOSERV_USERNAME, NEOSERV_PASSWORD, or NEOSERV_ZONE")
+	if username == "" || password == "" || totpKey == "" || zone == "" {
+		panic("missing required environment variables NEOSERV_USERNAME, NEOSERV_PASSWORD, NEOSERV_TOTP, or NEOSERV_ZONE")
 	}
 	provider = Provider{
-		Username: username,
-		Password: password,
+		Username:   username,
+		Password:   password,
+		TOTPSecret: totpKey,
 	}
 	err = provider.init()
 	if err != nil {
 		panic(err)
+	}
+}
+
+func TestTOTP(t *testing.T) {
+	// RFC 6238 appendix B, SHA-1 secret "12345678901234567890", last 6 digits.
+	for ts, want := range map[int64]string{59: "287082", 1111111109: "081804", 2000000000: "279037"} {
+		if got, _ := totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", time.Unix(ts, 0)); got != want {
+			t.Errorf("totp at %d = %s, want %s", ts, got, want)
+		}
 	}
 }
 
@@ -59,18 +71,18 @@ func TestAuthenticateCorrect(t *testing.T) {
 	}
 	var session *http.Cookie
 	for _, cookie := range cookies {
-		if cookie.Name == "moj_session" {
+		if cookie.Name == sessionCookieName {
 			session = cookie
 			break
 		}
 	}
 
 	if session == nil {
-		t.Fatal("moj_session cookie not set")
+		t.Fatal("session cookie not set")
 	}
 
 	t.Logf("Authenticated as %s", username)
-	t.Logf("moj_session cookie: %s", session)
+	t.Logf("session cookie: %s", session)
 }
 
 func TestAuthenticateIncorrect(t *testing.T) {
@@ -105,7 +117,7 @@ func TestAuthenticateIncorrect(t *testing.T) {
 // shared provider used by the other tests. The dedicated provider authenticates
 // from the shared on-disk cache, so it does not require a login of its own.
 func TestSessionExpiryRecovery(t *testing.T) {
-	p := Provider{Username: username, Password: password}
+	p := Provider{Username: username, Password: password, TOTPSecret: totpKey}
 	if err := p.init(); err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,7 @@ You can check out a minimal example of using this provider in the [examples](./e
 Run it with:
 
 ```bash
-NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password NEOSERV_ZONE=your.domain go run ./examples/neoserv.go
+NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password NEOSERV_TOTP=YOUR2FAKEY NEOSERV_ZONE=your.domain go run ./examples/neoserv.go
 ```
 
 ## RFC 2136 Proxy
@@ -31,6 +31,7 @@ The [`examples/rfc2136`](./examples/rfc2136) directory contains a small DNS serv
 | --------------------- | --------------------------------- | -------------------------------------------- |
 | `NEOSERV_USERNAME`    | —                                 | Neoserv account email (required)             |
 | `NEOSERV_PASSWORD`    | —                                 | Neoserv account password (required)          |
+| `NEOSERV_TOTP`        | —                                 | Neoserv 2FA key (required)                   |
 | `NEOSERV_ZONE`        | —                                 | optional; if set, only this zone is accepted |
 | `RFC2136_TSIG_SECRET` | —                                 | base64-encoded TSIG shared secret (required) |
 | `RFC2136_TSIG_KEY`    | `acme.`                           | TSIG key name                                |
@@ -44,6 +45,7 @@ Create a `.env` file in `examples/rfc2136/`:
 ```env
 NEOSERV_USERNAME=your@email.com
 NEOSERV_PASSWORD=your_password
+NEOSERV_TOTP=YOUR2FAKEY
 RFC2136_TSIG_SECRET=<base64-encoded secret>
 # NEOSERV_ZONE=your.domain      # optional: restrict to one zone
 # RFC2136_TSIG_KEY=acme.        # optional: default is acme.
@@ -64,7 +66,7 @@ The proxy listens on `HOST_PORT` (default `5353`) on the host.
 ```bash
 cd examples/rfc2136
 RFC2136_TSIG_SECRET=$(head -c32 /dev/urandom | base64) \
-NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password \
+NEOSERV_USERNAME=your@email.com NEOSERV_PASSWORD=your_password NEOSERV_TOTP=YOUR2FAKEY \
 go run .
 ```
 
@@ -132,11 +134,34 @@ network errors and `429`/`5xx` responses are retried with backoff. Record types
 that Neoserv exposes but libdns does not model (e.g. `WR` redirects) are returned as
 an internal record type that still round-trips through delete.
 
+## Two-Factor Login
+
+Two-factor login (TOTP) is required. Without it, Neoserv emails a code on every
+login from a new device, which an unattended client cannot answer. To set it up:
+
+1. In Moj NEOSERV, open "Omogoči dvostopenjsko prijavo". The page shows a QR code
+   and a key for manual setup ("Ključ, za ročno nameščanje").
+2. Copy the key and keep it; it is the value the provider needs.
+3. Add the key to an authenticator app (Google or Microsoft Authenticator, or
+   similar), either by scanning the QR code or by entering the key manually.
+4. Type the 6-digit code the app shows into the box on the page to confirm it and
+   enable two-factor login.
+5. Pass the key as `TOTPSecret` (`NEOSERV_TOTP` in the examples), alongside the
+   username and password. The provider generates the codes itself:
+
+```go
+provider := neoserv.Provider{
+	Username:   "your-neoserv-email",
+	Password:   "your-neoserv-password",
+	TOTPSecret: "YOUR2FAKEY",
+}
+```
+
 ## Session Caching
 
 Neoserv rate-limits the login endpoint, which is easy to hit while developing or
 running the test suite. To avoid this, the provider reuses an existing session
-instead of logging in on every run. On a successful login the `moj_session` cookie
+instead of logging in on every run. On a successful login the `neoserv_session` cookie
 is persisted to disk and reused (after a cheap validity check) until it expires;
 only when no valid cached session exists does the provider log in again.
 
@@ -147,6 +172,7 @@ point it elsewhere, or opt out of disk caching entirely:
 provider := neoserv.Provider{
 	Username:            "your-neoserv-email",
 	Password:            "your-neoserv-password",
+	TOTPSecret:          "YOUR2FAKEY",
 	SessionCachePath:    "/path/to/session.json", // optional; default is a temp file
 	DisableSessionCache: true,                     // opt out of on-disk caching
 }
@@ -175,6 +201,7 @@ By default, if an unsupported TTL is provided, the provider will use the closest
 provider := neoserv.Provider{
 	Username:              "your-neoserv-email",
 	Password:              "your-neoserv-password",
+	TOTPSecret:            "YOUR2FAKEY",
 	UnsupportedTTLisError: true,
 }
 ```

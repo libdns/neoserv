@@ -3,6 +3,10 @@ package neoserv
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base32"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -29,11 +33,13 @@ func mustParseURL(s string) *url.URL {
 }
 
 const (
-	urlBase          = "https://moj.neoserv.si"
-	urlLogin         = urlBase + "/login"
-	urlServices      = urlBase + "/services?type=domains"
-	urlDomainRecords = urlBase + "/domains/%s/records"
-	urlLivewire      = urlBase + "/livewire/update"
+	urlBase               = "https://moj.neoserv.si"
+	urlLogin              = urlBase + "/login"
+	urlVerification       = urlBase + "/verification"        // TOTP challenge
+	urlDeviceVerification = urlBase + "/device-verification" // emailed new-device code
+	urlServices           = urlBase + "/services?type=domains"
+	urlDomainRecords      = urlBase + "/domains/%s/records"
+	urlLivewire           = urlBase + "/livewire/update"
 )
 
 var (
@@ -198,7 +204,7 @@ func (p *Provider) retryTransport(req *http.Request) (*http.Response, error) {
 // redirectedToLogin reports whether a response landed on the login page, which is
 // how moj.neoserv.si signals that the session has expired.
 func redirectedToLogin(resp *http.Response) bool {
-	return resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/login")
+	return resp.Request != nil && resp.Request.URL.String() == urlLogin
 }
 
 // loginRateLimitMarker is a stable, ASCII-only fragment of the Slovenian
@@ -259,7 +265,7 @@ func (p *Provider) refreshSession(ctx context.Context) error {
 // isAuthenticated reports whether a Laravel session cookie is present.
 func (p *Provider) isAuthenticated() bool {
 	for _, cookie := range p.client.Jar.Cookies(urlBaseP) {
-		if cookie.Name == "moj_session" {
+		if cookie.Name == sessionCookieName {
 			return true
 		}
 	}
@@ -291,7 +297,31 @@ func (p *Provider) authenticate(ctx context.Context) error {
 	return p.login(ctx)
 }
 
-// login performs a fresh username/password login and persists the session. Its
+// postForm submits an urlencoded form with retryTransport, following redirects.
+func (p *Provider) postForm(ctx context.Context, target string, form url.Values) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", target)
+	return p.retryTransport(req)
+}
+
+// totp returns the RFC 6238 code (SHA-1, 30 s step, 6 digits) for a base32 secret.
+func totp(secret string, t time.Time) (string, error) {
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.ReplaceAll(strings.TrimRight(secret, "="), " ", "")))
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha1.New, key)
+	binary.Write(mac, binary.BigEndian, uint64(t.Unix()/30))
+	h := mac.Sum(nil)
+	o := h[len(h)-1] & 15
+	return fmt.Sprintf("%06d", binary.BigEndian.Uint32(h[o:])&0x7fffffff%1000000), nil
+}
+
+// login performs a fresh username/password/TOTP login and persists the session. Its
 // requests use retryTransport (never doWithRetry), so login can never recurse
 // into session-refresh handling.
 func (p *Provider) login(ctx context.Context) error {
@@ -322,33 +352,49 @@ func (p *Provider) login(ctx context.Context) error {
 	}
 
 	// Step 2: POST /login with credentials.
-	form := url.Values{}
-	form.Set("_token", csrfToken)
-	form.Set("email", p.Username)
-	form.Set("password", p.Password)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlLogin, strings.NewReader(form.Encode()))
-	if err != nil {
-		return fmt.Errorf("failed to create login request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", urlLogin)
-
-	resp, err := p.retryTransport(req)
+	resp, err := p.postForm(ctx, urlLogin, url.Values{
+		"_token":   {csrfToken},
+		"email":    {p.Username},
+		"password": {p.Password},
+	})
 	if err != nil {
 		return fmt.Errorf("failed to perform login request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Laravel redirects back to /login on a failed login; any other path means
-	// success. A failure is either bad credentials or, after too many attempts,
-	// a temporary rate-limit block that we surface distinctly.
-	if strings.HasSuffix(resp.Request.URL.Path, "/login") {
+	// Laravel redirects back to /login on a failed login. A failure is either bad
+	// credentials or, after too many attempts, a temporary rate-limit block that
+	// we surface distinctly.
+	switch resp.Request.URL.String() {
+	case urlLogin:
 		body, _ := io.ReadAll(resp.Body)
 		if isLoginRateLimited(string(body)) {
 			return ErrLoginRateLimited
 		}
 		return fmt.Errorf("authentication failed")
+	case urlDeviceVerification:
+		return fmt.Errorf("login requires an emailed device code; enable two-factor login on the account and set TOTPSecret")
+	case urlVerification:
+		// Step 3: two-factor login is enabled, submit the current TOTP code.
+		code, err := totp(p.TOTPSecret, time.Now())
+		if err != nil {
+			return fmt.Errorf("failed to generate two-factor code: %w", err)
+		}
+		doc, err := goquery.NewDocumentFromReader(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to parse two-factor page: %w", err)
+		}
+		resp2, err := p.postForm(ctx, urlVerification, url.Values{
+			"_token":          {doc.Find("input[name='_token']").AttrOr("value", "")},
+			"two_factor_code": {code},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to perform two-factor request: %w", err)
+		}
+		resp2.Body.Close()
+		if resp2.Request.URL.String() == urlVerification {
+			return fmt.Errorf("two-factor code rejected; check TOTPSecret and the system clock")
+		}
 	}
 
 	// Persist the fresh session so later runs can skip the login.

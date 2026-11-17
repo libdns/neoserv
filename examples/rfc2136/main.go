@@ -12,6 +12,7 @@
 //
 //	NEOSERV_USERNAME     Neoserv account email (required)
 //	NEOSERV_PASSWORD     Neoserv account password (required)
+//	NEOSERV_TOTP         Neoserv 2FA key (required)
 //	NEOSERV_ZONE         optional: if set, only this zone is accepted
 //	RFC2136_TSIG_SECRET  base64-encoded TSIG shared secret (required)
 //	RFC2136_TSIG_KEY     TSIG key name, default "acme."
@@ -57,14 +58,15 @@ type update struct {
 func main() {
 	username := os.Getenv("NEOSERV_USERNAME")
 	password := os.Getenv("NEOSERV_PASSWORD")
+	totp := os.Getenv("NEOSERV_TOTP")
 	keyName := os.Getenv("RFC2136_TSIG_KEY")
 	if keyName == "" {
 		keyName = "acme."
 	}
 	keyName = dns.Fqdn(keyName)
 	secret := os.Getenv("RFC2136_TSIG_SECRET")
-	if username == "" || password == "" || secret == "" {
-		log.Fatal("set NEOSERV_USERNAME, NEOSERV_PASSWORD and RFC2136_TSIG_SECRET")
+	if username == "" || password == "" || totp == "" || secret == "" {
+		log.Fatal("set NEOSERV_USERNAME, NEOSERV_PASSWORD, NEOSERV_TOTP and RFC2136_TSIG_SECRET")
 	}
 
 	listen := os.Getenv("RFC2136_LISTEN")
@@ -81,7 +83,7 @@ func main() {
 	}
 
 	p := &proxy{
-		provider:    &neoserv.Provider{Username: username, Password: password},
+		provider:    &neoserv.Provider{Username: username, Password: password, TOTPSecret: totp},
 		tsigKeyName: keyName,
 		allowZone:   strings.ToLower(dns.Fqdn(os.Getenv("NEOSERV_ZONE"))),
 		upstream:    upstream,

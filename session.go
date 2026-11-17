@@ -8,11 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // sessionCookieName is the Laravel session cookie set by moj.neoserv.si.
-const sessionCookieName = "moj_session"
+const sessionCookieName = "neoserv_session"
 
 // sessionCookieDomain is the domain the server scopes the session cookie to. It
 // is shared across neoserv.si and its subdomains, so injected cookies must use
@@ -36,7 +35,7 @@ func (p *Provider) sessionCacheFile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("neoserv-session-%x.json", sum[:8]))
 }
 
-// sessionCookieValue returns the current moj_session cookie value, or "".
+// sessionCookieValue returns the current session cookie value, or "".
 func (p *Provider) sessionCookieValue() string {
 	for _, c := range p.client.Jar.Cookies(urlBaseP) {
 		if c.Name == sessionCookieName {
@@ -46,7 +45,7 @@ func (p *Provider) sessionCookieValue() string {
 	return ""
 }
 
-// setSessionCookie seeds the cookie jar with a moj_session value, scoped to the
+// setSessionCookie seeds the cookie jar with a session cookie value, scoped to the
 // same domain the server uses so it replaces the server's cookie rather than
 // coexisting with it as a host-only duplicate.
 func (p *Provider) setSessionCookie(value string) {
@@ -58,7 +57,7 @@ func (p *Provider) setSessionCookie(value string) {
 	}})
 }
 
-// clearSessionCookies removes any moj_session cookie from the jar, covering both
+// clearSessionCookies removes any session cookie from the jar, covering both
 // the server's domain-scoped cookie and any host-only one, so a login starts from
 // a clean slate.
 func (p *Provider) clearSessionCookies() {
@@ -111,7 +110,7 @@ func (p *Provider) sessionValid(ctx context.Context) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK && !strings.HasSuffix(resp.Request.URL.Path, "/login")
+	return resp.StatusCode == http.StatusOK && resp.Request.URL.String() != urlLogin
 }
 
 // reuseSession tries to authenticate without logging in, by reusing a session
